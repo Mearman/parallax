@@ -207,7 +207,10 @@ def form_vllm_batch_prefill(
         vllm_req = _build_vllm_request(req, sampling_params, model_runner, include_outputs=False)
         created_vllm_requests.append(vllm_req)
 
-        computed_blocks, num_computed_tokens = kv_cache_manager.get_computed_blocks(vllm_req)
+        # The third value is the shared-prefix boundary; vLLM's scheduler records it on the request.
+        computed_blocks, num_computed_tokens, vllm_req.shared_prefix_boundary = (
+            kv_cache_manager.get_computed_blocks(vllm_req)
+        )
 
         prompt_token_ids = getattr(req, "input_ids", None) or []
         num_new_tokens = max(len(prompt_token_ids) - num_computed_tokens, 0)
