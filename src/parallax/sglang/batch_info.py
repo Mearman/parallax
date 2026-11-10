@@ -125,6 +125,18 @@ def _get_or_create_sgl_req(
     return req
 
 
+def _materialise_prefill_input_ids(schedule_batch: ScheduleBatch) -> None:
+    """Move the prompt tokens SGLang staged on the host onto the batch's device.
+
+    SGLang stages a prefill's token ids in pinned host memory and copies them to the device when its
+    scheduler launches the forward; Parallax launches the forward itself, so it performs that copy.
+    """
+    schedule_batch.input_ids = schedule_batch.prefill_input_ids_cpu.to(
+        schedule_batch.device, non_blocking=True
+    )
+    schedule_batch.prefill_input_ids_cpu = None
+
+
 def _set_dp_token_counts(schedule_batch: ScheduleBatch, model_runner: ModelRunner) -> None:
     num_tokens = schedule_batch.extend_num_tokens
     dp_size = get_parallel().attn_dp_size
@@ -230,6 +242,7 @@ def form_sgl_chunked_batch_prefill(
     schedule_batch.prepare_for_extend()
     _set_dp_token_counts(schedule_batch, model_runner)
 
+    _materialise_prefill_input_ids(schedule_batch)
     forward_batch = ForwardBatch.init_new(
         schedule_batch, model_runner, return_hidden_states_before_norm=False
     )
@@ -272,6 +285,7 @@ def form_sgl_batch_prefill(
     schedule_batch.prepare_for_extend()
     _set_dp_token_counts(schedule_batch, model_runner)
 
+    _materialise_prefill_input_ids(schedule_batch)
     forward_batch = ForwardBatch.init_new(
         schedule_batch, model_runner, return_hidden_states_before_norm=False
     )
@@ -377,6 +391,8 @@ def form_sgl_batch_decode(
             ret.device, non_blocking=True
         )
     ret.prepare_for_decode()
+    # SGLang feeds a decode step from input_ids, which its scheduler sets to the previous step's token.
+    ret.input_ids = ret.output_ids
     # TODO: this is a hack to make the seq_lens correct due to select_batch is not refference running batch's seq_lens
     # need to fix this
     running_batch.seq_lens[ready_indices] += 1
