@@ -262,6 +262,9 @@ def form_vllm_batch_prefill(
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         kv_connector_metadata=None,
+        # The drafter proposes this many tokens for the next step; vLLM's scheduler sets it, and left at its
+        # default of zero the drafter proposes nothing.
+        num_spec_tokens_to_schedule=model_runner.num_spec_tokens,
     )
 
     return scheduler_output
@@ -392,6 +395,9 @@ def form_vllm_batch_decode(
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         kv_connector_metadata=None,
+        # The drafter proposes this many tokens for the next step; vLLM's scheduler sets it, and left at its
+        # default of zero the drafter proposes nothing.
+        num_spec_tokens_to_schedule=model_runner.num_spec_tokens,
     )
 
     return scheduler_output
