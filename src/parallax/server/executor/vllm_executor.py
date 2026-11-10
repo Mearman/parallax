@@ -32,6 +32,7 @@ from parallax.vllm.speculative import (
     accepted_token_ids_of,
     SpeculationStats,
     commit_accepted,
+    keep_the_drafters_own_embeddings_on_stages_without_them,
 )
 from parallax_utils.logging_config import get_logger
 
@@ -102,6 +103,8 @@ class VLLMExecutor(BaseExecutor):
     ):
         self.enable_return_routed_experts = enable_return_routed_experts
         self.speculation = SpeculationStats()
+        # A stage without the first layers has no embedding table of its own; the drafter keeps the copy it loads.
+        keep_the_drafters_own_embeddings_on_stages_without_them()
         self.routed_experts_reader = None
         self.routed_experts_instance_id = None
 
@@ -384,6 +387,17 @@ class VLLMExecutor(BaseExecutor):
             # Intermediate peer: return hidden states for next peer
             return {"hidden_states": execute_model_state.hidden_states, "probs": None}
 
+    def prepare_next_batch_requests(
+        self, requests: List[Request], batch_output: Any, context_lengths: Any
+    ) -> List[Request]:
+        next_batch = super().prepare_next_batch_requests(requests, batch_output, context_lengths)
+        if self.is_last_peer and not self.is_first_peer:
+            # The first peer embeds the drafts into its next chunk, so it needs the ones this stage will verify.
+            for request in next_batch:
+                drafts = self.model_runner.pending_drafts.get(request.request_id)
+                request.draft_token_ids = list(drafts) if drafts else None
+        return next_batch
+
     def _release_request(self, rid: str):
         """Release per-request resources in vLLM."""
         try:
@@ -657,6 +671,17 @@ class VLLMExecutor(BaseExecutor):
                 }
             )
             logger.debug(f"PP Proxy: hidden_states shape: {hidden_states.shape}")
+
+        if not self.is_first_peer:
+            # The previous peer ran the input token and the drafts this stage proposed last step, so the rows it sent
+            # must be exactly those; any other pairing would verify the wrong tokens.
+            for req in batched_requests:
+                expected = list(self.model_runner.pending_drafts.get(req.request_id, []))
+                if list(req.draft_token_ids or []) != expected or req.hidden_states.shape[0] != 1 + len(expected):
+                    raise ValueError(
+                        f"{req.request_id}: the previous peer sent {req.hidden_states.shape[0]} rows with drafts "
+                        f"{req.draft_token_ids}, but this stage proposed {expected}"
+                    )
 
         # Prepare lengths (common for both backends)
         lengths = []
