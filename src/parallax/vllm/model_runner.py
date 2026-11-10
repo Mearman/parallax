@@ -25,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import get_current_attn_bac
 from vllm.distributed.parallel_state import GroupCoordinator as VLLMGroupCoordinator
 from vllm.lora.request import LoRARequest
 from vllm.platforms import current_platform
+from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.utils import (
     get_supported_kv_cache_layouts,
     record_kv_cache_layout,
@@ -225,6 +226,28 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
 
         finally:
             vllm.distributed.utils.get_pp_indices = original_get_pp_indices
+
+    def sync_and_gather_intermediate_tensors(
+        self,
+        num_tokens: int,
+        intermediate_tensors: IntermediateTensors | None,
+        sync_self: bool,
+    ) -> IntermediateTensors:
+        """Take the previous peer's hidden states, padded with zero rows to the batch vLLM padded to a graph size.
+
+        vLLM pads a batch to a captured CUDA graph size and expects every pipeline rank to send tensors of that padded length.
+        The previous peer here is not a vLLM rank and sends exactly the rows of the batch's tokens, so the rest are zeros: the
+        padded positions are computed and their outputs discarded.
+        """
+        if sync_self and intermediate_tensors is not None:
+            padded = {}
+            for name, value in intermediate_tensors.items():
+                missing = num_tokens - value.shape[0]
+                if missing > 0:
+                    value = torch.cat([value, value.new_zeros((missing, *value.shape[1:]))])
+                padded[name] = value
+            intermediate_tensors = IntermediateTensors(padded)
+        return super().sync_and_gather_intermediate_tensors(num_tokens, intermediate_tensors, sync_self)
 
     def execute_model(
         self, scheduler_output, intermediate_tensors=None, return_decoded_tokens=False
