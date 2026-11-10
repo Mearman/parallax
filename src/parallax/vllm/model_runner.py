@@ -423,64 +423,8 @@ def initialize_vllm_model_runner(
     device = torch.device(f"cuda:{tp_rank}")
     torch.cuda.set_device(device)
 
-    if not parallel_state.model_parallel_is_initialized():
-        logger.debug(f"Initializing vLLM distributed environment...")
-
-        # Set environment variables for distributed initialization
-        if "RANK" not in os.environ:
-            os.environ["RANK"] = str(tp_rank)
-        if "WORLD_SIZE" not in os.environ:
-            os.environ["WORLD_SIZE"] = str(tp_size)
-        if "LOCAL_RANK" not in os.environ:
-            os.environ["LOCAL_RANK"] = str(tp_rank)
-        if "MASTER_ADDR" not in os.environ:
-            os.environ["MASTER_ADDR"] = "localhost"
-        if "MASTER_PORT" not in os.environ:
-            os.environ["MASTER_PORT"] = str(nccl_port)
-
-        try:
-            parallel_state.init_distributed_environment()
-
-            # Initialize with pp_size=1 for single process
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=1,
-                pipeline_model_parallel_size=1,
-            )
-
-            # Monkey patch the PP group with our custom Parallax coordinator
-            # that uses layer ranges to determine is_first_rank/is_last_rank
-            original_pp_group = parallel_state._PP
-            if original_pp_group is not None:
-                # Get backend from device_group (torch is already imported at module level)
-
-                backend = torch.distributed.get_backend(original_pp_group.device_group)
-
-                # Create a Parallax PP group coordinator
-                # Need to wrap ranks in a list of lists for group_ranks parameter
-                parallax_pp_group = ParallaxVLLMGroupCoordinator(
-                    group_ranks=[original_pp_group.ranks],
-                    local_rank=original_pp_group.local_rank,
-                    torch_distributed_backend=backend,
-                    use_device_communicator=original_pp_group.use_device_communicator,
-                    use_message_queue_broadcaster=(original_pp_group.mq_broadcaster is not None),
-                    group_name="pp",
-                    pp_start_layer=start_layer,
-                    pp_end_layer=end_layer,
-                    num_hidden_layers=num_hidden_layers,
-                )
-                # Replace the PP group
-                parallel_state._PP = parallax_pp_group
-                logger.debug(
-                    f"Replaced vLLM PP group with Parallax coordinator: "
-                    f"is_first_rank={parallax_pp_group.is_first_rank}, "
-                    f"is_last_rank={parallax_pp_group.is_last_rank}"
-                )
-
-            logger.debug(f"vLLM distributed environment initialized")
-        except Exception as e:
-            logger.warning(f"Failed to initialize distributed environment: {e}")
-            logger.error(f"vLLM distributed initialization failed. Error: {e}")
-            raise
+    if enable_return_routed_experts:
+        raise NotImplementedError("routed-experts capture is not supported by this vLLM's ModelConfig")
 
     if end_layer > num_hidden_layers:
         raise ValueError(
@@ -502,13 +446,11 @@ def initialize_vllm_model_runner(
         seed=0,
         max_model_len=max_len,
         max_logprobs=1,
-        enable_return_routed_experts=enable_return_routed_experts,
     )
 
     cache_config = CacheConfig(
         block_size=kv_block_size,
         gpu_memory_utilization=kv_cache_memory_fraction,
-        swap_space=0,
         cache_dtype="auto",
     )
 
@@ -531,7 +473,7 @@ def initialize_vllm_model_runner(
         max_num_seqs=max_num_seqs,
         max_model_len=model_config.max_model_len,
         is_encoder_decoder=False,
-        enable_chunked_prefill=False,
+        enable_chunked_prefill=True,
     )
 
     # LoRA Config construction
@@ -595,6 +537,68 @@ def initialize_vllm_model_runner(
         additional_config={},
         instance_id=instance_id or "",
     )
+
+    # vLLM's parallel-state setup reads the current config, so it runs inside the config context.
+    with set_current_vllm_config(vllm_config):
+        if not parallel_state.model_parallel_is_initialized():
+            logger.debug(f"Initializing vLLM distributed environment...")
+
+            # Set environment variables for distributed initialization
+            if "RANK" not in os.environ:
+                os.environ["RANK"] = str(tp_rank)
+            if "WORLD_SIZE" not in os.environ:
+                os.environ["WORLD_SIZE"] = str(tp_size)
+            if "LOCAL_RANK" not in os.environ:
+                os.environ["LOCAL_RANK"] = str(tp_rank)
+            if "MASTER_ADDR" not in os.environ:
+                os.environ["MASTER_ADDR"] = "localhost"
+            if "MASTER_PORT" not in os.environ:
+                os.environ["MASTER_PORT"] = str(nccl_port)
+
+            try:
+                parallel_state.init_distributed_environment()
+
+                # Initialize with pp_size=1 for single process
+                parallel_state.initialize_model_parallel(
+                    tensor_model_parallel_size=1,
+                    pipeline_model_parallel_size=1,
+                )
+
+                # Monkey patch the PP group with our custom Parallax coordinator
+                # that uses layer ranges to determine is_first_rank/is_last_rank
+                original_pp_group = parallel_state._PP
+                if original_pp_group is not None:
+                    # Get backend from device_group (torch is already imported at module level)
+
+                    backend = torch.distributed.get_backend(original_pp_group.device_group)
+
+                    # Create a Parallax PP group coordinator
+                    # Need to wrap ranks in a list of lists for group_ranks parameter
+                    parallax_pp_group = ParallaxVLLMGroupCoordinator(
+                        group_ranks=[original_pp_group.ranks],
+                        local_rank=original_pp_group.local_rank,
+                        torch_distributed_backend=backend,
+                        use_device_communicator=original_pp_group.use_device_communicator,
+                        use_message_queue_broadcaster=(original_pp_group.mq_broadcaster is not None),
+                        group_name="pp",
+                        pp_start_layer=start_layer,
+                        pp_end_layer=end_layer,
+                        num_hidden_layers=num_hidden_layers,
+                    )
+                    # Replace the PP group
+                    parallel_state._PP = parallax_pp_group
+                    logger.debug(
+                        f"Replaced vLLM PP group with Parallax coordinator: "
+                        f"is_first_rank={parallax_pp_group.is_first_rank}, "
+                        f"is_last_rank={parallax_pp_group.is_last_rank}"
+                    )
+
+                logger.debug(f"vLLM distributed environment initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize distributed environment: {e}")
+                logger.error(f"vLLM distributed initialization failed. Error: {e}")
+                raise
+
 
     model_runner = ParallaxVLLMModelRunner(
         vllm_config=vllm_config,
