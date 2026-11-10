@@ -5,39 +5,19 @@ arguments needed by decentralized inference.
 """
 
 import logging
-import os
 import random
 from typing import List, Optional
 
-import sglang
-import sglang.srt.distributed.parallel_state
-import torch
 from mlx_lm.utils import load_config
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tp_group,
-    get_world_group,
-    init_distributed_environment,
-    set_custom_all_reduce,
-    set_mscclpp_all_reduce,
-    set_torch_symm_mem_all_reduce,
-)
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
-    initialize_dp_attention,
-)
+from sglang.srt.distributed.bootstrap import init_layer_runtime, init_parallel_runtime
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.model_executor.model_runner import ModelRunner as SGLModelRunner
+from sglang.srt.runtime_context import SpawnRanks, get_device, get_parallel, publish
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    get_available_gpu_memory,
-    get_bool_env_var,
-    monkey_patch_p2p_access_check,
-)
 
 from parallax.sglang.monkey_patch import apply_parallax_sglang_monkey_patch
+from parallax.sglang.monkey_patch_utils.model_parallel import install_layer_range
 from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
     set_layer_range_for_filtering,
 )
@@ -46,13 +26,17 @@ from parallax.utils.utils import normalize_model_config
 
 logger = logging.getLogger(__name__)
 
-_is_cpu_amx_available = cpu_has_amx_support()
+# Any width above one makes SGLang treat the runner as a pipeline stage.
+PIPELINE_WIDTH_SEEN_BY_MODEL = 2
 
 
 class ParallaxModelRunner(SGLModelRunner):
-    """
-    Parallax ModelRunner module.
-    pp_start_layer and pp_end_layer are passed to initialize states of distribution.
+    """Parallax ModelRunner module.
+
+    The runner owns one contiguous layer range of the model. SGLang builds its process groups
+    from the published runtime configuration, so this publishes the configuration, brings the
+    parallel runtime up exactly as the scheduler entry does, and then records the layer range on
+    the pipeline group, which is where the model code and the patched layer builder read it.
     """
 
     def __init__(
@@ -60,162 +44,43 @@ class ParallaxModelRunner(SGLModelRunner):
         model_config: ModelConfig,
         mem_fraction_static: float,
         gpu_id: int,
-        tp_rank: int,
-        tp_size: int,
-        moe_ep_rank: int,
-        moe_ep_size: int,
-        pp_rank: int,
-        pp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
         pp_start_layer: int,
         pp_end_layer: int,
-        dp_size: int = 1,
-        dp_rank: int = 0,
+        tp_rank: int = 0,
     ):
-        """Add pp_start_layer and pp_end_layer for decentralized model"""
+        """Publish the runtime, build the groups for this layer range, then load the model."""
         self.pp_start_layer = pp_start_layer
         self.pp_end_layer = pp_end_layer
         num_hidden_layers = model_config.hf_config.num_hidden_layers
         set_layer_range_for_filtering(pp_start_layer, pp_end_layer, num_hidden_layers)
 
+        publish(
+            server_args,
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=tp_rank, gpu_id=gpu_id),
+        )
+        init_parallel_runtime(
+            server_args=server_args,
+            device=get_device().device,
+            dist_port=nccl_port,
+        )
+        init_layer_runtime(model_config=model_config)
+        install_layer_range(
+            get_parallel().pp_group, pp_start_layer, pp_end_layer, num_hidden_layers
+        )
+        # The model code and the graph runner take the pipeline path only when the published
+        # pipeline width exceeds one; every Parallax node is one stage of a larger pipeline.
+        get_parallel().override_permanently(pp_size=PIPELINE_WIDTH_SEEN_BY_MODEL)
+
         super().__init__(
             model_config=model_config,
             mem_fraction_static=mem_fraction_static,
             gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            pp_rank=pp_rank,
-            pp_size=pp_size,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_size=moe_ep_size,
             nccl_port=nccl_port,
             server_args=server_args,
-            dp_rank=dp_rank,
         )
-
-    def init_torch_distributed(self):
-        """
-        Modifies init_torch_distributed in sglang.
-        The only difference is to replace initialize_model_parallel.
-        """
-        logger.info("Init torch distributed begin.")
-
-        try:
-            torch.get_device_module(self.device).set_device(self.gpu_id)
-        except Exception:
-            logger.warning(
-                f"Context: {self.device=} {self.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} \
-                {self.tp_rank=} {self.tp_size=}"
-            )
-            raise
-
-        if self.device == "cuda":
-            backend = "nccl"
-        elif self.device == "xpu":
-            backend = "xccl"
-        elif self.device == "hpu":
-            backend = "hccl"
-        elif self.device == "cpu":
-            backend = "gloo"
-        elif self.device == "npu":
-            backend = "hccl"
-        else:
-            backend = "gloo"
-
-        before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        if not self.server_args.enable_p2p_check:
-            monkey_patch_p2p_access_check()
-
-        if self.server_args.dist_init_addr:
-            dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
-        else:
-            dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
-        set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
-        set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
-        set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
-
-        if not self.is_draft_worker:
-            if self.device == "cpu":
-                if _is_cpu_amx_available:
-                    # Bind OpenMP threads to CPU cores
-                    torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
-
-                    # Set local size to hint SGLang to use shared memory based AllReduce
-                    os.environ["LOCAL_SIZE"] = str(self.tp_size)
-                    torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
-                else:
-                    logger.warning(
-                        "init_cpu_threads_env and shared memory based AllReduce is disabled \
-                         since intel amx backend is not available"
-                    )
-
-            # Only initialize the distributed environment on the target model worker.
-            init_distributed_environment(
-                backend=backend,
-                world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
-                local_rank=self.gpu_id,
-                distributed_init_method=dist_init_method,
-                timeout=self.server_args.dist_timeout,
-                moe_a2a_backend=self.server_args.moe_a2a_backend,
-                recovered_rank=self.server_args.elastic_ep_rejoin,
-            )
-
-            # Use monkey patch modified function
-            sglang.srt.distributed.parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=self.tp_size,
-                pipeline_model_parallel_size=self.pp_size,
-                expert_model_parallel_size=self.moe_ep_size,
-                attention_data_parallel_size=self.dp_size,
-                attention_context_model_parallel_size=self.attn_cp_size,
-                moe_data_model_parallel_size=self.moe_dp_size,
-                duplicate_tp_group=self.server_args.enable_pdmux,
-                enable_symm_mem=self.server_args.enable_symm_mem,
-                recovered_rank=self.server_args.elastic_ep_rejoin,
-                pp_start_layer=self.pp_start_layer,
-                pp_end_layer=self.pp_end_layer,
-                hidden_layers=self.model_config.num_hidden_layers,
-            )
-
-            initialize_dp_attention(
-                self.server_args,
-                self.model_config,
-            )
-
-        min_per_gpu_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-        )
-        self.tp_group = get_tp_group()
-        self.pp_group = get_pp_group()
-        self.attention_tp_group = get_attention_tp_group()
-
-        # Check memory for tensor parallelism
-        local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        if self.tp_size > 1 and not self.is_draft_worker:
-            if min_per_gpu_memory < local_gpu_memory * 0.9:
-                if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
-                    logger.warning(
-                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                        f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
-                    )
-                else:
-                    raise ValueError(
-                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                        f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
-                    )
-
-        logger.info(
-            f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
-        )
-
-        # This is a hack for initializing CudaGraphRunner
-        self.server_args.pp_size = 2
-
-        return min_per_gpu_memory
 
 
 def form_sgl_server_args(
@@ -387,18 +252,11 @@ def initialize_sgl_model_runner(
         model_config=model_config,
         mem_fraction_static=kv_cache_memory_fraction,
         gpu_id=tp_rank,  # Currently reuse tp_rank to only support TP.
-        tp_rank=tp_rank,
-        tp_size=tp_size,
-        pp_rank=0,
-        pp_size=1,
-        moe_ep_rank=0,
-        moe_ep_size=1,
         nccl_port=nccl_port,
         server_args=server_args,
         pp_start_layer=start_layer,
         pp_end_layer=end_layer,
-        dp_rank=dp_rank,
-        dp_size=dp_size,
+        tp_rank=tp_rank,
     )
     return model_runner, config, tokenizer
 

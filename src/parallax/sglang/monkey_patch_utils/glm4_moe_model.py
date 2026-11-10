@@ -4,7 +4,7 @@ import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors

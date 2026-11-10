@@ -23,7 +23,7 @@ def apply_qwen3_next_monkey_patch():
     - Qwen3NextForCausalLM.load_weights: pre-filter weights by layer_id to load only local slice.
     """
     import torch
-    from sglang.srt.distributed import get_pp_group
+    from sglang.srt.distributed.parallel_state import get_pp_group
     from sglang.srt.layers.dp_attention import is_dp_attention_enabled
     from sglang.srt.layers.layernorm import GemmaRMSNorm
     from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
