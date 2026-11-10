@@ -2,9 +2,10 @@
 Store information about a SGLang batch.
 The following is the flow of data structures for a batch in SGLang:
 
-ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
+ScheduleBatch -> ForwardBatch
 """
 
+from array import array
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -12,6 +13,7 @@ import torch
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache as PageRadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -68,7 +70,7 @@ def transform_requests_to_sglang(
         req = Req(
             rid=old_req.request_id,
             origin_input_text="",
-            origin_input_ids=old_req.origin_input_ids or old_req.input_ids,
+            origin_input_ids=array("q", old_req.origin_input_ids or old_req.input_ids),
             sampling_params=sampling_params,
             lora_id=old_req.lora_id,
         )
@@ -82,14 +84,16 @@ def transform_requests_to_sglang(
             )
 
         req.init_next_round_input(page_tree_cache)
+        # Without a chunking policy the whole remaining prompt is extended in this round.
+        req.extend_end = len(req.full_untruncated_fill_ids)
 
         # Debug: Log after cache lookup
         if page_tree_cache is not None:
-            prefix_indices_len = len(req.prefix_indices) if hasattr(req, "prefix_indices") else 0
+            prefix_indices_len = req.prefix_len
             input_len = len(req.origin_input_ids) if hasattr(req, "origin_input_ids") else 0
             logger.debug(
                 f"[PageRadixCache] After init_next_round_input for request {old_req.request_id}: "
-                f"prefix_indices length={prefix_indices_len}, "
+                f"prefix length={prefix_indices_len}, "
                 f"origin_input_ids length={input_len}, "
                 f"matched_tokens={prefix_indices_len}, "
                 f"cache_hit_ratio={prefix_indices_len/input_len if input_len > 0 else 0:.2%}"
@@ -112,7 +116,7 @@ def _get_or_create_sgl_req(
     req = Req(
         rid=old_req.request_id,
         origin_input_text="",
-        origin_input_ids=old_req.origin_input_ids or old_req.input_ids,
+        origin_input_ids=array("q", old_req.origin_input_ids or old_req.input_ids),
         sampling_params=sampling_params,
         lora_id=old_req.lora_id,
     )
@@ -204,7 +208,7 @@ def form_sgl_chunked_batch_prefill(
         is_middle_chunk = chunked_req is not None and sgl_req is chunked_req
         set_request_prefill_chunk(
             req,
-            chunk_end=len(sgl_req.fill_ids),
+            chunk_end=sgl_req.extend_end,
             is_chunked=is_middle_chunk,
         )
         selected_requests.append(req)
@@ -225,8 +229,9 @@ def form_sgl_chunked_batch_prefill(
     schedule_batch.prepare_for_extend()
     _set_dp_token_counts(schedule_batch, model_runner)
 
-    model_worker_batch = schedule_batch.get_model_worker_batch()
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    forward_batch = ForwardBatch.init_new(
+        schedule_batch, model_runner, return_hidden_states_before_norm=False
+    )
     return SGLPrefillBatch(
         schedule_batch=schedule_batch,
         forward_batch=forward_batch,
@@ -240,7 +245,7 @@ def form_sgl_batch_prefill(
     model_runner: ModelRunner,
     page_tree_cache: Optional[PageRadixCache] = None,
 ) -> ForwardBatch:
-    """Initialize a prefill ScheduleBatch -> ModelWorkerBatch -> ForwardBatch workflow"""
+    """Initialize a prefill ScheduleBatch -> ForwardBatch workflow"""
 
     tree_cache = page_tree_cache
     if tree_cache is None:
@@ -266,8 +271,9 @@ def form_sgl_batch_prefill(
     schedule_batch.prepare_for_extend()
     _set_dp_token_counts(schedule_batch, model_runner)
 
-    model_worker_batch = schedule_batch.get_model_worker_batch()
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    forward_batch = ForwardBatch.init_new(
+        schedule_batch, model_runner, return_hidden_states_before_norm=False
+    )
     return schedule_batch, forward_batch
 
 
@@ -350,7 +356,7 @@ def form_sgl_batch_decode(
     """
     Forms the decoding batch in this round.
     The returned ScheduleBatch is a copy of subset of the running batch.
-    ModelWorkerBatch -> ForwardBatch are generated from the selected ScheduleBatch.
+    The ForwardBatch is generated from the selected ScheduleBatch.
     """
     ready_indices = list(
         filter(lambda x: x != -1, [find_index(running_batch, req.request_id) for req in requests])
@@ -382,10 +388,9 @@ def form_sgl_batch_decode(
         ret.global_num_tokens = [num_tokens] * dp_size
         ret.global_num_tokens_for_logprob = [num_tokens] * dp_size
 
-    model_worker_batch = ret.get_model_worker_batch()
-    if requests[0].lora_id is not None:
-        model_worker_batch.lora_ids = [req.lora_id or "" for req in requests]
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    forward_batch = ForwardBatch.init_new(
+        ret, model_runner, return_hidden_states_before_norm=False
+    )
 
     return forward_batch
 
@@ -394,35 +399,16 @@ def release_sglang_request(running_batch: ScheduleBatch, request_id: str):
     """Release KV Cache and other resources for finished/aborted requests."""
     if running_batch is None or running_batch.is_empty():
         return
-    seq_lens_cpu = running_batch.seq_lens.cpu().numpy()
     idx = find_index(running_batch, request_id)
     req = running_batch.reqs.pop(idx)
 
     # use running batch's tree cache to release kv cache
     tree_cache = running_batch.tree_cache
+    release_kv_cache(req, tree_cache, checkpoint=not tree_cache.disable)
 
-    if isinstance(tree_cache, PageRadixCache):
-        tree_cache.cache_finished_req(req)
-    else:
-        page_size = running_batch.token_to_kv_pool_allocator.page_size
-        last_uncached_pos = (len(req.prefix_indices) // page_size) * page_size
-        end_pos = last_uncached_pos + seq_lens_cpu[idx]
-        running_batch.seq_lens = torch.cat(
-            (running_batch.seq_lens[:idx], running_batch.seq_lens[idx + 1 :])
-        )
-        running_batch.seq_lens_cpu = torch.cat(
-            (running_batch.seq_lens_cpu[:idx], running_batch.seq_lens_cpu[idx + 1 :])
-        )
-        running_batch.orig_seq_lens = torch.cat(
-            (running_batch.orig_seq_lens[:idx], running_batch.orig_seq_lens[idx + 1 :])
-        )
-
-        # Free kv cache
-        token_indices = running_batch.req_to_token_pool.req_to_token[req.req_pool_idx][
-            last_uncached_pos:end_pos
-        ]
-        running_batch.token_to_kv_pool_allocator.free(token_indices)
-        running_batch.req_to_token_pool.free(req.req_pool_idx)
-        running_batch.req_pool_indices = torch.cat(
-            (running_batch.req_pool_indices[:idx], running_batch.req_pool_indices[idx + 1 :])
-        )
+    keep = torch.arange(len(running_batch.seq_lens)) != idx
+    keep_device = keep.to(running_batch.seq_lens.device)
+    running_batch.seq_lens = running_batch.seq_lens[keep_device]
+    running_batch.seq_lens_cpu = running_batch.seq_lens_cpu[keep]
+    running_batch.orig_seq_lens = running_batch.orig_seq_lens[keep_device]
+    running_batch.req_pool_indices = running_batch.req_pool_indices[keep_device]
