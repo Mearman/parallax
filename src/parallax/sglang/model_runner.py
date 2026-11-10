@@ -68,6 +68,7 @@ class ParallaxModelRunner(SGLModelRunner):
             dist_port=nccl_port,
         )
         init_layer_runtime(model_config=model_config)
+        initialize_moe_config()
         install_layer_range(
             get_parallel().pp_group, pp_start_layer, pp_end_layer, num_hidden_layers
         )
@@ -219,7 +220,6 @@ def initialize_sgl_model_runner(
         max_lora_chunk_size,
         max_num_tokens_per_batch=max_num_tokens_per_batch,
     )
-    initialize_moe_config(server_args)
     quant_method = None
     if (quantization_config := config.get("quantization_config", None)) is not None:
         quant_method = quantization_config.get("quant_method")
