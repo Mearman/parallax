@@ -45,6 +45,7 @@ from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
 )
 from parallax.utils.tokenizer_utils import load_tokenizer
 from parallax.utils.utils import normalize_model_config
+from parallax.vllm.speculative import pad_sampled_token_ids
 from parallax.vllm.monkey_patch import apply_parallax_vllm_monkey_patch
 from parallax_utils.logging_config import get_logger
 from parallax_utils.prepare_adapter import download_adapter_config
@@ -145,6 +146,8 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
         # Draft tokens the speculative drafter proposed for each request's next step; the decode batch schedules them
         # and the target model verifies them.
         self.pending_drafts: Dict[str, List[int]] = {}
+        # How many draft slots the last step scheduled for each request.
+        self.step_draft_counts: Dict[str, int] = {}
 
         super().__init__(vllm_config=vllm_config, device=device)
         self.kv_cache_config = kv_cache_config
@@ -235,9 +238,16 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
             if hasattr(self.execute_model_state, "logits"):
                 logits = self.execute_model_state.logits
 
+            self.step_draft_counts = {
+                request_id: len(scheduler_output.scheduled_spec_decode_tokens.get(request_id, ()))
+                for request_id in scheduler_output.num_scheduled_tokens
+            }
             sampler_output = super().sample_tokens(grammar_output=None)
-            sampled_token_ids = sampler_output._sampled_token_ids
-            sampled_token_ids_cpu = sampler_output.sampled_token_ids_cpu
+            # Not async: the output lists, per request in batch order, the tokens its step accepted.
+            sampled_token_ids_cpu = pad_sampled_token_ids(
+                sampler_output.sampled_token_ids, 1 + self.num_spec_tokens
+            )
+            sampled_token_ids = sampled_token_ids_cpu.to(self.device)
             drafts = self.take_draft_token_ids()
             if drafts is not None:
                 for request_id, draft_token_ids in zip(drafts.req_ids, drafts.draft_token_ids):

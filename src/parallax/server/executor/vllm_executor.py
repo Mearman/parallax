@@ -249,7 +249,9 @@ class VLLMExecutor(BaseExecutor):
                         accepted = accepted_token_ids(req)
                         if req.hidden_states is not None:
                             self.speculation.record(
-                                original_req.request_id, req.hidden_states.shape[-1], len(accepted)
+                                original_req.request_id,
+                                self.model_runner.step_draft_counts.get(original_req.request_id, 0),
+                                len(accepted),
                             )
                         committed = commit_accepted(
                             original_req,

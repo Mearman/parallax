@@ -2,6 +2,7 @@
 
 from typing import Any, Callable, Dict, List
 
+import torch
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 
 
@@ -38,21 +39,35 @@ def commit_accepted(request: Any, token_ids: List[int], finishes: Callable[[Any]
     return committed
 
 
+def pad_sampled_token_ids(rows: List[List[int]], width: int) -> torch.Tensor:
+    """One row per request of the tokens its step accepted, padded on the right with PLACEHOLDER_TOKEN_ID to `width`.
+
+    Without async scheduling vLLM returns the accepted tokens as lists of different lengths; the rest of Parallax reads one
+    fixed-width row per request, the shape the async output had.
+    """
+    padded = torch.full((len(rows), width), PLACEHOLDER_TOKEN_ID, dtype=torch.int64)
+    for index, row in enumerate(rows):
+        assert len(row) <= width, f"a step accepted {len(row)} tokens but the row is {width} wide"
+        if row:
+            padded[index, : len(row)] = torch.tensor(row, dtype=torch.int64)
+    return padded
+
+
 class SpeculationStats:
     """What speculation did for each request: its steps, the tokens they accepted, and how many of the drafted slots were accepted.
 
-    A step's sampled row is one wider than the number of draft slots it scheduled (the bonus token), so a row of width w that
-    accepted n tokens used w - 1 draft slots and accepted n - 1 drafts.
+    A step that scheduled d draft slots and accepted n tokens accepted n - 1 drafts (the first token is the one the step
+    would have produced anyway).
     """
 
     def __init__(self) -> None:
         self._steps: Dict[str, List[int]] = {}
 
-    def record(self, request_id: str, row_width: int, accepted: int) -> None:
+    def record(self, request_id: str, draft_slots: int, accepted: int) -> None:
         steps = self._steps.setdefault(request_id, [0, 0, 0, 0])
         steps[0] += 1
         steps[1] += accepted
-        steps[2] += row_width - 1
+        steps[2] += draft_slots
         steps[3] += accepted - 1
 
     def summary(self, request_id: str) -> str:
