@@ -3,24 +3,20 @@
 Summary:
 - ParallaxGroupCoordinator: a pipeline group whose first and last rank are decided by the layer
     range the process owns, installed on an existing group by install_layer_range.
-- monkey_patch_make_layers: replaces sglang.srt.utils.make_layers; uses
-    get_pp_group().pp_start_layer/end_layer to instantiate local layers and PPMissingLayer
-    placeholders for non-local layers.
+- parallax_get_pp_indices: replaces sglang's get_pp_indices wherever it is imported, so the layers
+    a stage builds and the layers its KV cache covers are the range recorded on the group.
 
 These are minimal, reversible patches to support decentralized per-layer pipeline parallelism.
 Remove when upstream sglang provides native support.
 """
 
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Tuple
 
-import sglang.srt.utils
-import torch
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator as SGLGroupCoordinator,
 )
-from sglang.srt.utils import LayerFn, add_prefix
-
+from sglang.srt.distributed.parallel_state import get_pp_group
 
 logger = logging.getLogger(__name__)
 
@@ -80,42 +76,29 @@ def install_layer_range(
     pp_group.hidden_layers = hidden_layers
 
 
-def monkey_patch_make_layers(
-    num_hidden_layers: int,
-    layer_fn: LayerFn,
-    pp_rank: Optional[int] = None,
-    pp_size: Optional[int] = None,
-    prefix: str = "",
-    return_tuple: bool = False,
-    offloader_kwargs: Optional[Dict[str, Any]] = None,
-) -> Tuple[torch.nn.ModuleList, int, int]:
-    """A monkey patch to replace sglang.srt.utils.make_layers"""
-    # circula imports
-    from sglang.srt.distributed.parallel_state import get_pp_group
-    from sglang.srt.layers.utils import PPMissingLayer
-    from sglang.srt.utils.offloader import get_offloader
+def parallax_get_pp_indices(
+    num_hidden_layers: int, pp_rank: int, pp_size: int
+) -> Tuple[int, int]:
+    """Return the layer range this process owns instead of SGLang's even split.
 
-    assert not pp_size or num_hidden_layers >= pp_size
-    start_layer, end_layer = get_pp_group().pp_start_layer, get_pp_group().pp_end_layer
-
-    modules = torch.nn.ModuleList(
-        [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
-        + get_offloader().wrap_modules(
-            (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                for idx in range(start_layer, end_layer)
-            ),
-            **(offloader_kwargs or {}),
-        )
-        + [PPMissingLayer(return_tuple=return_tuple) for _ in range(end_layer, num_hidden_layers)]
-    )
-    if pp_rank is None or pp_size is None:
-        return modules
-    return modules, start_layer, end_layer
+    SGLang decides which layers a stage builds, and which layers its KV cache covers, by calling
+    get_pp_indices. Parallax assigns ranges itself and records them on the pipeline group, so
+    every caller must see that range, whatever pipeline rank and width it passes.
+    """
+    group = get_pp_group()
+    return group.pp_start_layer, group.pp_end_layer
 
 
 def apply_model_parallel_monkey_patch():
-    sglang.srt.utils.make_layers = monkey_patch_make_layers
-    import sglang.srt.utils.common as utils_common
+    """Make every SGLang caller of get_pp_indices see the layer range recorded on the group."""
+    import sys
 
-    utils_common.make_layers = monkey_patch_make_layers
+    import sglang.srt.distributed.utils as distributed_utils
+
+    original = distributed_utils.get_pp_indices
+    if original is parallax_get_pp_indices:
+        return
+    # Modules that imported the function by name keep their own reference, so replace each one.
+    for module in list(sys.modules.values()):
+        if getattr(module, "get_pp_indices", None) is original:
+            module.get_pp_indices = parallax_get_pp_indices
