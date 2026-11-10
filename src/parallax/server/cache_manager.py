@@ -628,6 +628,68 @@ class CacheManager:
         self.context_lengths[request_id] += 1
         return True
 
+    def extend_slots(self, request_id: str, num_tokens: int) -> bool:
+        """Reserve cache for several new tokens of a decoding request at once.
+
+        A speculative verify step processes the committed token and its drafts together, so it needs
+        the room of all of them. On failure the request is left as it was.
+        """
+        if not self.needs_blocks:
+            return True
+        length_before = self.context_lengths[request_id]
+        blocks_before = len(self.block_tables[request_id])
+        for _ in range(num_tokens):
+            if not self.append_slot(request_id):
+                self.truncate_context(request_id, length_before)
+                del self.block_tables[request_id][blocks_before:]
+                return False
+        return True
+
+    def truncate_context(self, request_id: str, length: int) -> None:
+        """Forget the tokens of a request beyond `length`, returning the blocks that held only those.
+
+        The cache entries of the forgotten tokens are not erased: the next tokens overwrite them, and
+        attention reads only up to the context length.
+        """
+        if not self.needs_blocks:
+            return
+        if not 0 <= length <= self.context_lengths[request_id]:
+            raise ValueError(
+                f"cannot truncate {request_id} to {length} tokens: it holds "
+                f"{self.context_lengths[request_id]}"
+            )
+        blocks_needed = (length + self.block_size - 1) // self.block_size
+        table = self.block_tables[request_id]
+        extra = table[blocks_needed:]
+        if extra:
+            self.allocator.free(extra)
+            del table[blocks_needed:]
+        self.context_lengths[request_id] = length
+
+    def snapshot_state(self, request_id: str) -> int:
+        """Copy a request's linear (recurrent) state into a scratch slot and return the slot.
+
+        Returns -1 when the model keeps no recurrent state, and raises when no slot is free: a
+        request that cannot be snapshotted cannot be rolled back, so it must not speculate.
+        """
+        if not self.needs_slots:
+            return -1
+        scratch = self.slot_allocator.allocate()
+        if scratch == -1:
+            raise RuntimeError(f"no free state slot to snapshot {request_id}")
+        self._copy_linear_slot(scratch, self.request_slots[request_id])
+        return scratch
+
+    def restore_state(self, request_id: str, snapshot: int) -> None:
+        """Put a request's linear state back to the snapshot taken before a verify step."""
+        if snapshot != -1:
+            self._copy_linear_slot(self.request_slots[request_id], snapshot)
+
+    def release_snapshot(self, snapshot: int) -> None:
+        """Return a snapshot's scratch slot."""
+        if snapshot != -1:
+            self.slot_allocator.free(snapshot)
+
     def get_block_table(self, request_id: str) -> List[int]:
         return self.block_tables.get(request_id, [])
 
