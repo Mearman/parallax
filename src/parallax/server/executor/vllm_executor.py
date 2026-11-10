@@ -307,6 +307,9 @@ class VLLMExecutor(BaseExecutor):
                     req, IntermediateRequest
                 ), "Non-first peers must receive IntermediateRequests."
                 if req.is_finished or req.hidden_states is None:
+                    summary = self.speculation.summary(req.request_id)
+                    if summary:
+                        logger.info(summary)
                     self.release_and_evict_request(req.request_id)
                     if not self.is_last_peer:
                         self.finished_batch.append(req)
@@ -396,6 +399,12 @@ class VLLMExecutor(BaseExecutor):
             for request in next_batch:
                 drafts = self.model_runner.pending_drafts.get(request.request_id)
                 request.draft_token_ids = list(drafts) if drafts else None
+                if request.hidden_states is not None:
+                    self.speculation.record(
+                        request.request_id,
+                        self.model_runner.step_draft_counts.get(request.request_id, 0),
+                        len(accepted_token_ids(request)),
+                    )
         return next_batch
 
     def _release_request(self, rid: str):

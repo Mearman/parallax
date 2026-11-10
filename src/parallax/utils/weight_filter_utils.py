@@ -29,8 +29,14 @@ def should_include_weight_key(
     is_first_shard: bool,
     is_last_shard: bool,
     tie_word_embeddings: bool = False,
+    include_speculative: bool = False,
 ) -> bool:
     if is_first_shard and "embed_tokens" in key and key.startswith("model."):
+        return True
+
+    # A shard whose last stage drafts with the checkpoint's own multi-token-prediction layer loads that layer, and the
+    # drafter keeps its own copy of the embedding table, whichever layers the shard holds.
+    if include_speculative and (key.startswith("mtp.") or ("embed_tokens" in key and key.startswith("model."))):
         return True
 
     if is_last_shard:
@@ -57,6 +63,7 @@ def filter_weight_files_by_layer_range_for_load(
     is_first_shard: bool,
     is_last_shard: bool,
     config: Optional[Dict] = None,
+    include_speculative: bool = False,
 ) -> List[str]:
     index_file = model_path / "model.safetensors.index.json"
 
@@ -95,6 +102,7 @@ def filter_weight_files_by_layer_range_for_load(
             is_first_shard=is_first_shard,
             is_last_shard=is_last_shard,
             tie_word_embeddings=tie_word_embeddings,
+            include_speculative=include_speculative,
         ):
             needed_files.add(filename)
 

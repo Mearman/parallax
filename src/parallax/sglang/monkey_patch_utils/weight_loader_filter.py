@@ -11,11 +11,14 @@ logger = logging.getLogger(__name__)
 _layer_range_cache = {}
 
 
-def set_layer_range_for_filtering(pp_start_layer: int, pp_end_layer: int, num_hidden_layers: int):
+def set_layer_range_for_filtering(
+    pp_start_layer: int, pp_end_layer: int, num_hidden_layers: int, include_speculative: bool = False
+):
     global _layer_range_cache
     _layer_range_cache["pp_start_layer"] = pp_start_layer
     _layer_range_cache["pp_end_layer"] = pp_end_layer
     _layer_range_cache["num_hidden_layers"] = num_hidden_layers
+    _layer_range_cache["include_speculative"] = include_speculative
 
 
 def _filter_weight_files_by_cache(hf_weights_files: List[str]) -> List[str]:
@@ -43,6 +46,7 @@ def _filter_weight_files_by_cache(hf_weights_files: List[str]) -> List[str]:
         end_layer=pp_end_layer,
         is_first_shard=is_first_shard,
         is_last_shard=is_last_shard,
+        include_speculative=_layer_range_cache.get("include_speculative", False),
     )
 
     return filtered_files

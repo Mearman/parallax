@@ -81,6 +81,7 @@ def selective_model_download(
     start_layer: Optional[int] = None,
     end_layer: Optional[int] = None,
     local_files_only: bool = False,
+    include_speculative: bool = False,
 ) -> Path:
     local_path = Path(repo_id)
     if local_path.exists():
@@ -102,6 +103,7 @@ def selective_model_download(
             model_path=model_path,
             start_layer=start_layer,
             end_layer=end_layer,
+            include_speculative=include_speculative,
         )
 
         if not needed_weight_files:
@@ -158,6 +160,7 @@ def _determine_needed_weight_files_for_download(
     start_layer: int,
     end_layer: int,
     config: Optional[Dict] = None,
+    include_speculative: bool = False,
 ) -> List[str]:
     is_first_shard = start_layer == 0
 
@@ -218,6 +221,7 @@ def _determine_needed_weight_files_for_download(
             is_first_shard=is_first_shard,
             is_last_shard=is_last_shard,
             tie_word_embeddings=tie_word_embeddings,
+            include_speculative=include_speculative,
         ):
             needed_files.add(filename)
 

@@ -327,10 +327,13 @@ def initialize_vllm_model_runner(
         f"Initializing vLLM model runner for {model_repo}, " f"layers=[{start_layer}, {end_layer})"
     )
 
+    # A stage that drafts needs the checkpoint's multi-token-prediction weights and embedding table whichever layers it holds.
+    include_speculative = bool(kwargs.get("speculative_config"))
     model_path = selective_model_download(
         model_repo,
         start_layer=start_layer,
         end_layer=end_layer,
+        include_speculative=include_speculative,
     )
 
     # ParallaxVLLMModelRunner subclasses vLLM's v1 GPUModelRunner. The v2 runner, which newer vLLM selects by default,
@@ -360,7 +363,9 @@ def initialize_vllm_model_runner(
     # Reuse the generic monkey patch used by sglang implementation to reduce
     # local weight file reads when loading a partial layer shard.
     try:
-        set_layer_range_for_filtering(start_layer, end_layer, num_hidden_layers)
+        set_layer_range_for_filtering(
+            start_layer, end_layer, num_hidden_layers, include_speculative=include_speculative
+        )
         apply_weight_loader_filter_patch()
         logger.debug(
             f"Applied weight loader filter monkey patch for layers [{start_layer}, {end_layer})"
