@@ -286,6 +286,8 @@ class IntermediateRequest(Request):
         lora_path: Optional[str] = None,
         token_prob: Optional[float] = None,
         return_probs: bool = False,
+        accepted_token_ids: Optional[List[int]] = None,
+        draft_token_ids: Optional[List[int]] = None,
     ):
         super().__init__(
             request_id=request_id,
@@ -295,6 +297,12 @@ class IntermediateRequest(Request):
             sampling_params=sampling_params,
             lora_path=lora_path,
         )
+        # Speculative decoding. On the way down the pipeline, draft_token_ids are the drafts that
+        # follow the input token, whose hidden states are the rows after the first. On the way back to
+        # the first peer, accepted_token_ids are the tokens the step committed (the last one is the
+        # next input) and draft_token_ids are the next step's drafts. Both are None without speculation.
+        self.accepted_token_ids = accepted_token_ids
+        self.draft_token_ids = draft_token_ids
         # Hidden states from the previous peer's computation.
         # Shape:
         #   prefill: (prompt_len, hidden_dim)
@@ -390,6 +398,8 @@ class IntermediateRequest(Request):
             lora_path=lora_path,
             token_prob=token_prob,
             return_probs=old_request.return_probs,
+            accepted_token_ids=old_request.accepted_token_ids,
+            draft_token_ids=old_request.draft_token_ids,
         )
 
     def __repr__(self):

@@ -163,6 +163,38 @@ class TestMessageUtil:
         assert converted_request[0].origin_input_ids == list(range(8))
         assert converted_request[0].current_position == 4
 
+    def test_speculative_token_ids_survive_the_wire(self):
+        request = IntermediateRequest(
+            request_id=self.request_id,
+            input_ids=[1, 2, 3],
+            current_position=5,
+            status=RequestStatus.DECODING,
+            hidden_states=mx.zeros((3, 2), dtype=mx.float32),
+            sampling_params=self.sampling_params,
+            accepted_token_ids=[11, 12],
+            draft_token_ids=[21, 22],
+        )
+
+        converted = proto_to_request(request_to_proto([request]))[0]
+
+        assert converted.accepted_token_ids == [11, 12]
+        assert converted.draft_token_ids == [21, 22]
+
+    def test_a_request_without_speculation_carries_no_token_lists(self):
+        request = IntermediateRequest(
+            request_id=self.request_id,
+            input_ids=[1, 2, 3],
+            current_position=5,
+            status=RequestStatus.DECODING,
+            hidden_states=mx.zeros((1, 2), dtype=mx.float32),
+            sampling_params=self.sampling_params,
+        )
+
+        converted = proto_to_request(request_to_proto([request]))[0]
+
+        assert converted.accepted_token_ids is None
+        assert converted.draft_token_ids is None
+
     def test_multiple_requests(self):
         """Test conversion of multiple requests."""
         req1 = IntermediateRequest(

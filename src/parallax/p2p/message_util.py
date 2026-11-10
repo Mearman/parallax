@@ -58,6 +58,11 @@ def request_to_proto(
         if hasattr(request, "return_probs"):
             proto_req.return_probs = request.return_probs
 
+        if request.accepted_token_ids:
+            proto_req.accepted_token_ids.extend(request.accepted_token_ids)
+        if request.draft_token_ids:
+            proto_req.draft_token_ids.extend(request.draft_token_ids)
+
         forward_request.reqs.append(proto_req)
 
     return forward_request
@@ -114,6 +119,8 @@ def proto_to_request(
             lora_path=proto_req.lora_path if proto_req.lora_path != "" else None,
             token_prob=token_prob,
             return_probs=return_probs,
+            accepted_token_ids=list(proto_req.accepted_token_ids) or None,
+            draft_token_ids=list(proto_req.draft_token_ids) or None,
         )
 
         requests.append(request)

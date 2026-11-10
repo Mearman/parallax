@@ -38,6 +38,8 @@ message Req {
   string lora_path = 8;
   optional float token_prob = 9;  // Probability value for the sampled token
   bool return_probs = 10;  // Whether to return probabilities
+  repeated int32 accepted_token_ids = 11;  // Last peer to first peer: the tokens a speculative step committed, the last being the next input
+  repeated int32 draft_token_ids = 12;  // First peer to last peer: the drafts riding with the input token; last peer to first peer: the next step's drafts
 }
 
 message SamplingParams {
