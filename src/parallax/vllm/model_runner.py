@@ -299,6 +299,11 @@ def initialize_vllm_model_runner(
         end_layer=end_layer,
     )
 
+    # ParallaxVLLMModelRunner subclasses vLLM's v1 GPUModelRunner. The v2 runner, which newer vLLM selects by default,
+    # prepares per-step state (the hybrid models' aligned state indices) that only it provides, so the config must
+    # say v1 before it is built.
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+
     # Multimodal-style checkpoints nest the text model's fields; the layer count is read from the flattened config, as the SGLang runner does.
     config = normalize_model_config(load_config(model_path))
     tokenizer = load_tokenizer(model_path, eos_token_ids=config.get("eos_token_id", None))
