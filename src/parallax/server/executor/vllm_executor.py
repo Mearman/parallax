@@ -27,7 +27,11 @@ from parallax.vllm.batch_info import (
     resize_intermediate_tensors,
 )
 from parallax.vllm.model_runner import initialize_vllm_model_runner, refit_vllm_model
-from parallax.vllm.speculative import accepted_token_ids, accepted_token_ids_of
+from parallax.vllm.speculative import (
+    accepted_token_ids,
+    accepted_token_ids_of,
+    commit_accepted,
+)
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -240,11 +244,11 @@ class VLLMExecutor(BaseExecutor):
                     # the first one that finishes the request ends the step.
                     committed: List[int] = []
                     if not req.abort and req.next_token_id is not None:
-                        for token_id in accepted_token_ids(req):
-                            original_req.commit_new_token(token_id)
-                            committed.append(token_id)
-                            if self.scheduler.check_and_update_request_status(original_req):
-                                break
+                        committed = commit_accepted(
+                            original_req,
+                            accepted_token_ids(req),
+                            self.scheduler.check_and_update_request_status,
+                        )
                         logger.debug(
                             f"[FirstPeer-CUDA] Committed tokens {committed} for {req.request_id}, "
                             f"output_ids now has {len(original_req.output_ids)} tokens"
