@@ -167,7 +167,6 @@ def _build_vllm_request(
         prompt_token_ids=getattr(req, "input_ids", None),
         sampling_params=sampling_params,
         pooling_params=None,
-        eos_token_id=getattr(req, "eos_token_id", None),
         arrival_time=getattr(req, "arrival_time", 0.0),
         block_hasher=block_hasher,
         lora_request=lora_req,

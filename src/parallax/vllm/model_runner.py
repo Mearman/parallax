@@ -19,8 +19,14 @@ from vllm.config import (
     VllmConfig,
     set_current_vllm_config,
 )
+from vllm.distributed.kv_transfer.kv_connector.utils import get_current_attn_backends
 from vllm.distributed.parallel_state import GroupCoordinator as VLLMGroupCoordinator
 from vllm.lora.request import LoRARequest
+from vllm.v1.attention.backends.utils import (
+    get_supported_kv_cache_layouts,
+    record_kv_cache_layout,
+    resolve_kv_cache_layout,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
@@ -46,6 +52,30 @@ from parallax_utils.logging_config import get_logger
 from parallax_utils.prepare_adapter import download_adapter_config
 
 logger = get_logger(__name__)
+
+
+def resolve_cache_layout(vllm_config, kv_cache_specs) -> None:
+    """Resolve the KV cache layout once, as vLLM's engine core does before it sizes the cache.
+
+    This runner is the only worker, so the backends it reports are the whole agreement the core would
+    collect. A layout already on the cache config is kept, which makes a second call a no-op.
+    """
+    backends = get_current_attn_backends(vllm_config)
+    supported = [[layout.name for layout in get_supported_kv_cache_layouts(backends)]]
+    layout = resolve_kv_cache_layout(vllm_config, supported, kv_cache_specs.values())
+    record_kv_cache_layout(vllm_config.cache_config, layout.name)
+
+
+def adopt_kv_cache_config(vllm_config, kv_cache_config) -> None:
+    """Copy onto the cache config what vLLM's worker records when it initialises from a KV cache config.
+
+    The block count, hash block size and cache-hit alignment are read from the cache config later,
+    during warmup and by the cache manager.
+    """
+    cache_config = vllm_config.cache_config
+    cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+    cache_config.hash_block_size = kv_cache_config.hash_block_size
+    cache_config.cache_hit_alignment_tokens = kv_cache_config.cache_hit_alignment_tokens
 
 
 class ParallaxVLLMGroupCoordinator(VLLMGroupCoordinator):
@@ -189,12 +219,14 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
         )
 
         if kv_cache_specs is not None:
+            resolve_cache_layout(self.vllm_config, kv_cache_specs)
             kv_cache_configs = get_kv_cache_configs(
                 vllm_config=self.vllm_config,
                 kv_cache_specs=[kv_cache_specs],
                 available_memory=[available_memory],
             )
             kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+            adopt_kv_cache_config(self.vllm_config, kv_cache_config)
         else:
             logger.debug("Using fallback KV cache configuration")
 
@@ -243,7 +275,7 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
 
         return kv_cache_config
 
-    def initialize_kv_cache_manager(self, max_model_len: int, block_size: int) -> KVCacheManager:
+    def initialize_kv_cache_manager(self, max_model_len: int) -> KVCacheManager:
         logger.debug("Initializing vLLM KVCacheManager...")
 
         if self.kv_cache_config is None:
@@ -257,7 +289,8 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
             log_stats=True,
             enable_kv_cache_events=False,
             dcp_world_size=1,
-            hash_block_size=block_size,
+            scheduler_block_size=self.vllm_config.cache_config.block_size,
+            hash_block_size=self.kv_cache_config.hash_block_size,
         )
 
         self.kv_cache_manager = kv_cache_manager
@@ -636,6 +669,7 @@ def initialize_vllm_model_runner(
             f"({kv_cache_memory_fraction:.1%} of {free_memory / (1024**3):.2f} GB)"
         )
 
+        resolve_cache_layout(model_runner.vllm_config, kv_cache_specs)
         kv_cache_configs = get_kv_cache_configs(
             vllm_config=model_runner.vllm_config,
             kv_cache_specs=[kv_cache_specs],
@@ -643,6 +677,7 @@ def initialize_vllm_model_runner(
         )
 
         kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        adopt_kv_cache_config(model_runner.vllm_config, kv_cache_config)
 
         model_runner.kv_cache_config = kv_cache_config
 
@@ -651,9 +686,7 @@ def initialize_vllm_model_runner(
         logger.info("GPUModelRunner KV cache initialized successfully")
 
         logger.info("Initializing KV Cache Manager...")
-        model_runner.initialize_kv_cache_manager(
-            max_model_len=model_config.max_model_len, block_size=kv_block_size
-        )
+        model_runner.initialize_kv_cache_manager(max_model_len=model_config.max_model_len)
         logger.info("KV Cache Manager initialized successfully")
 
         # Warm up the model and capture CUDA graphs if enabled
