@@ -27,6 +27,7 @@ from parallax.vllm.batch_info import (
     resize_intermediate_tensors,
 )
 from parallax.vllm.model_runner import initialize_vllm_model_runner, refit_vllm_model
+from parallax.vllm.speculative import accepted_token_ids, accepted_token_ids_of
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -234,11 +235,18 @@ class VLLMExecutor(BaseExecutor):
                         )
                         continue
 
-                    # If it's an abort signal (e.g. from OOM), next_token_id might be None or dummy
+                    # If it's an abort signal (e.g. from OOM), next_token_id might be None or dummy.
+                    # A speculative step accepts several tokens at once; they are committed in order and
+                    # the first one that finishes the request ends the step.
+                    committed: List[int] = []
                     if not req.abort and req.next_token_id is not None:
-                        original_req.commit_new_token(req.next_token_id)
+                        for token_id in accepted_token_ids(req):
+                            original_req.commit_new_token(token_id)
+                            committed.append(token_id)
+                            if self.scheduler.check_and_update_request_status(original_req):
+                                break
                         logger.debug(
-                            f"[FirstPeer-CUDA] Committed token {req.next_token_id} for {req.request_id}, "
+                            f"[FirstPeer-CUDA] Committed tokens {committed} for {req.request_id}, "
                             f"output_ids now has {len(original_req.output_ids)} tokens"
                         )
 
@@ -257,11 +265,19 @@ class VLLMExecutor(BaseExecutor):
                     else:
                         self.scheduler.enque_request(original_req)
 
-                    # Send token/terminal update to the Rust frontend.
+                    # Send token/terminal update to the Rust frontend: every committed token, the last one
+                    # carrying the request's finish state.
                     if self.tp_rank == 0:
+                        for token_id in committed[:-1]:
+                            self._send_engine_core_token_output(
+                                request_id=original_req.request_id,
+                                token_id=token_id,
+                                finish_reason=None,
+                                stop_reason=None,
+                            )
                         self.send_engine_core_request_output(
                             request=original_req,
-                            token_id=req.next_token_id,
+                            token_id=committed[-1] if committed else req.next_token_id,
                         )
                 else:
                     raise TypeError(f"First peer received unexpected request type: {type(req)}")
@@ -389,7 +405,7 @@ class VLLMExecutor(BaseExecutor):
             torch.int64,
             torch.int32,
         ), "Single node must generate an output_id."
-        next_token_id = int(hidden_states[0])
+        next_token_id = accepted_token_ids_of(hidden_states)[0]
         return next_token_id, hidden_states
 
     def _tensor_parallel_broadcast_pyobj(self, broadcast_obj):

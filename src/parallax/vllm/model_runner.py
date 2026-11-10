@@ -142,6 +142,9 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
         self.request_block_hasher: Optional[Callable[[Any], List[Any]]] = None
         self.enable_prefix_caching: bool = False
         self.lora_history: List[Tuple[str, int, str]] = []  # lora_name, lora_id, lora_path
+        # Draft tokens the speculative drafter proposed for each request's next step; the decode batch schedules them
+        # and the target model verifies them.
+        self.pending_drafts: Dict[str, List[int]] = {}
 
         super().__init__(vllm_config=vllm_config, device=device)
         self.kv_cache_config = kv_cache_config
@@ -235,6 +238,10 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
             sampler_output = super().sample_tokens(grammar_output=None)
             sampled_token_ids = sampler_output._sampled_token_ids
             sampled_token_ids_cpu = sampler_output.sampled_token_ids_cpu
+            drafts = self.take_draft_token_ids()
+            if drafts is not None:
+                for request_id, draft_token_ids in zip(drafts.req_ids, drafts.draft_token_ids):
+                    self.pending_drafts[request_id] = [int(token) for token in draft_token_ids]
 
         return (
             self.execute_model_state,

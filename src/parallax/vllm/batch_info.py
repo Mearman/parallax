@@ -292,6 +292,7 @@ def form_vllm_batch_decode(
     num_computed_tokens: List[int] = []
     num_output_tokens: List[int] = []
     num_scheduled_tokens: Dict[str, int] = {}
+    scheduled_spec_decode_tokens: Dict[str, List[int]] = {}
 
     for req in batched_requests:
         req_ids.append(req.request_id)
@@ -350,9 +351,14 @@ def form_vllm_batch_decode(
             f"output_len={len(output_ids)}, computed_tokens={computed_token_count}"
         )
 
+        # The step verifies the draft tokens the drafter proposed after the last one, on top of the one new token.
+        drafts = model_runner.pending_drafts.get(req.request_id, [])
+        if drafts:
+            scheduled_spec_decode_tokens[req.request_id] = drafts
+
         new_blocks = kv_cache_manager.allocate_slots(
             request=vllm_req,
-            num_new_tokens=1,
+            num_new_tokens=1 + len(drafts),
             num_new_computed_tokens=0,
         )
 
@@ -363,7 +369,7 @@ def form_vllm_batch_decode(
         new_block_ids.append(new_blocks.get_block_ids(allow_none=True))
         num_computed_tokens.append(computed_token_count)
         num_output_tokens.append(len(output_ids))
-        num_scheduled_tokens[req.request_id] = 1
+        num_scheduled_tokens[req.request_id] = 1 + len(drafts)
 
     cached_req_data = CachedRequestData(
         req_ids=req_ids,
@@ -380,7 +386,7 @@ def form_vllm_batch_decode(
         scheduled_cached_reqs=cached_req_data,
         num_scheduled_tokens=num_scheduled_tokens,
         total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
-        scheduled_spec_decode_tokens={},
+        scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
         scheduled_encoder_inputs={},
         num_common_prefix_blocks=[0] * getattr(kv_cache_manager, "num_kv_cache_groups", 1),
         finished_req_ids=set(),
@@ -397,6 +403,7 @@ def release_vllm_request(model_runner: Any, request_id: str):
         return
 
     kv_cache_manager = model_runner.kv_cache_manager
+    model_runner.pending_drafts.pop(request_id, None)
 
     try:
         kv_cache_manager.coordinator.free(request_id)
