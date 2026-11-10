@@ -16,6 +16,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import SUPPORTED_LORA_TARGET_MODULES
 
 from parallax.server.executor.base_executor import BaseExecutor
+from parallax.server.step_timings import StepTimings
 from parallax.server.request import (
     InitialRequest,
     IntermediateRequest,
@@ -199,6 +200,7 @@ class SGLExecutor(BaseExecutor):
             kv_block_size=self.model_runner.page_size,
             conn=conn,
         )
+        self.step_timings = StepTimings()
         self.cur_batch = None
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
         self.sgl_req_by_rid = {}
@@ -384,6 +386,9 @@ class SGLExecutor(BaseExecutor):
 
                     if self.scheduler.check_and_update_request_status(original_req):
                         logger.debug(f"Releasing resources for finished request {req.request_id}")
+                        timing = self.step_timings.summary(req.request_id)
+                        if timing:
+                            logger.info(timing)
                         self.release_and_evict_request(req.request_id)
                         if not self.is_last_peer and not req.abort:
                             self.finished_batch.append(req)
@@ -424,10 +429,15 @@ class SGLExecutor(BaseExecutor):
         requests = prepared_inputs.get("requests", [])
 
         # Execute model with SGLang
+        started = self.step_timings.clock()
         out = self.model_runner.forward(
             forward_batch=forward_batch,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        forward_seconds = self.step_timings.clock() - started
+        phase = "forward_extend" if forward_batch.forward_mode.is_extend() else "forward_decode"
+        for req in requests:
+            self.step_timings.record(req.request_id, phase, forward_seconds)
         logits_output = out.logits_output
 
         # Merge completed prefill batches into the running batch. For middle
