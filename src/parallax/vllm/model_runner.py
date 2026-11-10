@@ -282,6 +282,11 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
         if self.kv_cache_config is None:
             self.kv_cache_config = self._create_kv_cache_config()
 
+        # vLLM's scheduler falls back to the block size when the cache config carries no hash block size.
+        hash_block_size = self.kv_cache_config.hash_block_size
+        if hash_block_size is None:
+            hash_block_size = self.vllm_config.cache_config.block_size
+
         kv_cache_manager = KVCacheManager(
             kv_cache_config=self.kv_cache_config,
             max_model_len=max_model_len,
@@ -291,7 +296,7 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
             enable_kv_cache_events=False,
             dcp_world_size=1,
             scheduler_block_size=self.vllm_config.cache_config.block_size,
-            hash_block_size=self.kv_cache_config.hash_block_size,
+            hash_block_size=hash_block_size,
         )
 
         self.kv_cache_manager = kv_cache_manager
