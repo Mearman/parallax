@@ -27,6 +27,7 @@ from parallax.vllm.batch_info import (
     resize_intermediate_tensors,
 )
 from parallax.vllm.model_runner import initialize_vllm_model_runner, refit_vllm_model
+from parallax.server.speculation import StepTimings
 from parallax.vllm.speculative import (
     accepted_token_ids,
     accepted_token_ids_of,
@@ -103,6 +104,7 @@ class VLLMExecutor(BaseExecutor):
     ):
         self.enable_return_routed_experts = enable_return_routed_experts
         self.speculation = SpeculationStats()
+        self.step_timings = StepTimings()
         # A stage without the first layers has no embedding table of its own; the drafter keeps the copy it loads.
         keep_the_drafters_own_embeddings_on_stages_without_them()
         self.routed_experts_reader = None
@@ -274,9 +276,12 @@ class VLLMExecutor(BaseExecutor):
                         original_req.abort = True
 
                     if self.scheduler.check_and_update_request_status(original_req):
-                        summary = self.speculation.summary(original_req.request_id)
-                        if summary:
-                            logger.info(summary)
+                        for line in (
+                            self.speculation.summary(original_req.request_id),
+                            self.step_timings.summary(original_req.request_id),
+                        ):
+                            if line:
+                                logger.info(line)
                         logger.debug(f"Releasing resources for finished request {req.request_id}")
                         self.release_and_evict_request(req.request_id)
                         if not self.is_last_peer:
@@ -307,9 +312,12 @@ class VLLMExecutor(BaseExecutor):
                     req, IntermediateRequest
                 ), "Non-first peers must receive IntermediateRequests."
                 if req.is_finished or req.hidden_states is None:
-                    summary = self.speculation.summary(req.request_id)
-                    if summary:
-                        logger.info(summary)
+                    for line in (
+                        self.speculation.summary(req.request_id),
+                        self.step_timings.summary(req.request_id),
+                    ):
+                        if line:
+                            logger.info(line)
                     self.release_and_evict_request(req.request_id)
                     if not self.is_last_peer:
                         self.finished_batch.append(req)
@@ -335,6 +343,7 @@ class VLLMExecutor(BaseExecutor):
         requests = prepared_inputs.get("requests", [])
 
         # Execute model with vLLM
+        started = self.step_timings.clock()
         execute_model_state, sampled_token_ids, sampled_token_ids_cpu, sampler_output, logits = (
             self.model_runner.execute_model(
                 scheduler_output=scheduler_output,
@@ -342,6 +351,9 @@ class VLLMExecutor(BaseExecutor):
                 return_decoded_tokens=return_decoded_tokens,
             )
         )
+        executed = self.step_timings.clock() - started
+        for req in requests:
+            self.step_timings.record(req.request_id, "execute_model", executed)
 
         # Return appropriate output based on peer position
         if return_decoded_tokens:

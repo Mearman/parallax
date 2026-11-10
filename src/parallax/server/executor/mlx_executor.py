@@ -20,7 +20,7 @@ from parallax.server.request import (
     RequestStatus,
 )
 from parallax.server.sampling.sampler import SamplingBatchInfo
-from parallax.server.speculation import accepted_token_ids, commit_accepted
+from parallax.server.speculation import StepTimings, accepted_token_ids, commit_accepted
 from parallax.server.split_speculation import FirstPeerSpeculation, Step
 from parallax.server.shard_loader import MLXModelLoader
 from parallax.utils.chunked_prefill import (
@@ -282,6 +282,9 @@ class MLXExecutor(BaseExecutor):
         # steps. It is inert until a returned token carries drafts.
         self.speculation = FirstPeerSpeculation(self.cache_manager) if self.is_first_peer else None
         self._verify_steps: Dict[str, Step] = {}
+        self.step_timings = StepTimings()
+        # When each request's verify step was sent down the pipeline.
+        self._sent_at: Dict[str, float] = {}
         if inline_prefill_chunk_size and (enable_prefix_cache or not self.is_first_peer):
             raise ValueError(
                 "--inline-prefill-chunk-size is for a first peer without a prefix cache; "
@@ -378,6 +381,9 @@ class MLXExecutor(BaseExecutor):
                         original_req.abort = True
 
                     if self.scheduler.check_and_update_request_status(original_req):
+                        timing = self.step_timings.summary(original_req.request_id)
+                        if timing:
+                            logger.info(timing)
                         self.speculation.release(original_req.request_id)
                         self.cache_manager.release_request(original_req.request_id)
                         logger.debug(
@@ -435,11 +441,16 @@ class MLXExecutor(BaseExecutor):
         accepted = accepted_token_ids(returned)
         drafts = returned.draft_token_ids or []
         rid = original_req.request_id
+        arrived = self.step_timings.clock()
+        if rid in self._sent_at:
+            self.step_timings.record(rid, "round_trip", arrived - self._sent_at.pop(rid))
         if self.speculation.in_flight(rid):
             self.speculation.finish(rid, accepted, drafts)
         elif drafts:
             self.speculation.start(rid, drafts)
-        return commit_accepted(original_req, accepted, self.scheduler.check_and_update_request_status)
+        committed = commit_accepted(original_req, accepted, self.scheduler.check_and_update_request_status)
+        self.step_timings.record(rid, "apply_verdict", self.step_timings.clock() - arrived)
+        return committed
 
     def prepare_next_batch_requests(
         self, requests: List[Request], batch_output: Any, context_lengths: Any
@@ -464,6 +475,7 @@ class MLXExecutor(BaseExecutor):
             rows = hidden_states[index, len(step.tokens) - step.send_rows : len(step.tokens), :]
             next_request = self._prepare_next_single_request(request, rows, None)
             next_request.draft_token_ids = list(self.speculation.drafts(request.request_id))
+            self._sent_at[request.request_id] = self.step_timings.clock()
             next_batch.append(next_request)
         return next_batch
 
@@ -495,6 +507,10 @@ class MLXExecutor(BaseExecutor):
 
         if self.cache_manager.needs_slots:
             self.cache_manager.materialize_linear_caches()
+        if prepared_inputs.get("verify_steps"):
+            chunk_seconds = time.time() - start_time
+            for req in prepared_inputs["requests"]:
+                self.step_timings.record(req.request_id, "m3_chunk", chunk_seconds)
 
         if logger.isEnabledFor(logging.DEBUG):
             forward_time = (time.time() - start_time) * 1000
