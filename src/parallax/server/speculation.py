@@ -52,8 +52,12 @@ class SpeculationStats:
 
     def __init__(self) -> None:
         self._steps: Dict[str, List[int]] = {}
+        # Per request: for each number of drafted slots a step carried, how many steps accepted each number of drafts.
+        self._by_slots: Dict[str, Dict[int, Dict[int, int]]] = {}
 
     def record(self, request_id: str, draft_slots: int, accepted: int) -> None:
+        counts = self._by_slots.setdefault(request_id, {}).setdefault(draft_slots, {})
+        counts[accepted - 1] = counts.get(accepted - 1, 0) + 1
         steps = self._steps.setdefault(request_id, [0, 0, 0, 0])
         steps[0] += 1
         steps[1] += accepted
@@ -66,9 +70,14 @@ class SpeculationStats:
         if steps is None:
             return ""
         step_count, tokens, draft_slots, accepted_drafts = steps
+        by_slots = self._by_slots.pop(request_id, {})
+        histogram = "; ".join(
+            f"{slots} slots: " + ", ".join(f"{drafts} accepted in {n}" for drafts, n in sorted(counts.items()))
+            for slots, counts in sorted(by_slots.items())
+        )
         return (
             f"speculation request {request_id}: {tokens} tokens in {step_count} steps, "
-            f"{accepted_drafts} of {draft_slots} drafted slots accepted"
+            f"{accepted_drafts} of {draft_slots} drafted slots accepted ({histogram})"
         )
 
 

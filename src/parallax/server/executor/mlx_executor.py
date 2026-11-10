@@ -425,6 +425,9 @@ class MLXExecutor(BaseExecutor):
                         f"memory usage: {mx.get_active_memory() / 1024**3 :.3f} GB"
                     )
                     self.scheduler.evict_request(req.request_id)
+                    timing = self.step_timings.summary(req.request_id)
+                    if timing:
+                        logger.info(timing)
                     if not self.is_last_peer and not req.abort:
                         self.finished_batch.append(req)
                 else:
@@ -507,10 +510,10 @@ class MLXExecutor(BaseExecutor):
 
         if self.cache_manager.needs_slots:
             self.cache_manager.materialize_linear_caches()
-        if prepared_inputs.get("verify_steps"):
-            chunk_seconds = time.time() - start_time
-            for req in prepared_inputs["requests"]:
-                self.step_timings.record(req.request_id, "m3_chunk", chunk_seconds)
+        forward_seconds = time.time() - start_time
+        phase = "m3_chunk" if prepared_inputs.get("verify_steps") else "m3_other"
+        for req in prepared_inputs["requests"]:
+            self.step_timings.record(req.request_id, phase, forward_seconds)
 
         if logger.isEnabledFor(logging.DEBUG):
             forward_time = (time.time() - start_time) * 1000
