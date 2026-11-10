@@ -487,6 +487,10 @@ def initialize_vllm_model_runner(
         block_size=kv_block_size,
         gpu_memory_utilization=kv_cache_memory_fraction,
         cache_dtype="auto",
+        # Parallax manages its own prefix state and never enables vLLM's. Leaving the default on puts hybrid
+        # (mamba) models in the "align" cache mode, which keeps a recurrent state per block and so needs far more
+        # memory than the one state per request that the "none" mode keeps.
+        enable_prefix_caching=False,
     )
 
     parallel_config = ParallelConfig(
@@ -508,7 +512,7 @@ def initialize_vllm_model_runner(
         max_num_seqs=max_num_seqs,
         max_model_len=model_config.max_model_len,
         is_encoder_decoder=False,
-        enable_chunked_prefill=True,
+        enable_chunked_prefill=False,
     )
 
     # LoRA Config construction
