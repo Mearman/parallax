@@ -40,6 +40,7 @@ from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
     set_layer_range_for_filtering,
 )
 from parallax.utils.tokenizer_utils import load_tokenizer
+from parallax.utils.utils import normalize_model_config
 from parallax.vllm.monkey_patch import apply_parallax_vllm_monkey_patch
 from parallax_utils.logging_config import get_logger
 from parallax_utils.prepare_adapter import download_adapter_config
@@ -263,7 +264,7 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
 
         return kv_cache_manager
 
-    def load_model(self) -> None:
+    def load_model(self, load_dummy_weights: bool = False, *, model=None) -> None:
         logger.debug(f"Loading vLLM model with layers [{self.start_layer}, {self.end_layer})...")
 
         from vllm.distributed.utils import get_pp_indices
@@ -282,7 +283,7 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
         vllm.distributed.utils.get_pp_indices = custom_get_pp_indices
 
         try:
-            super().load_model()
+            super().load_model(load_dummy_weights, model=model)
             logger.debug(
                 f"Successfully loaded {self.num_shard_layers} layers "
                 f"[{self.start_layer}:{self.end_layer}]"
@@ -387,7 +388,8 @@ def initialize_vllm_model_runner(
         end_layer=end_layer,
     )
 
-    config = load_config(model_path)
+    # Multimodal-style checkpoints nest the text model's fields; the layer count is read from the flattened config, as the SGLang runner does.
+    config = normalize_model_config(load_config(model_path))
     tokenizer = load_tokenizer(model_path, eos_token_ids=config.get("eos_token_id", None))
     dtype = config.get("torch_dtype", "bfloat16")
 
