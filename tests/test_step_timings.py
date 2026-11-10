@@ -1,4 +1,4 @@
-from parallax.server.speculation import StepTimings
+from parallax.server.step_timings import StepTimings
 
 
 def test_summary_averages_each_phase_and_forgets_the_request():

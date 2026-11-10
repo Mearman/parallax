@@ -20,7 +20,8 @@ from parallax.server.request import (
     RequestStatus,
 )
 from parallax.server.sampling.sampler import SamplingBatchInfo
-from parallax.server.speculation import StepTimings, accepted_token_ids, commit_accepted
+from parallax.server.speculation import accepted_token_ids, commit_accepted
+from parallax.server.step_timings import StepTimings
 from parallax.server.split_speculation import FirstPeerSpeculation, Step
 from parallax.server.shard_loader import MLXModelLoader
 from parallax.utils.chunked_prefill import (

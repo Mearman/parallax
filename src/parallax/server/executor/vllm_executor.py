@@ -27,7 +27,7 @@ from parallax.vllm.batch_info import (
     resize_intermediate_tensors,
 )
 from parallax.vllm.model_runner import initialize_vllm_model_runner, refit_vllm_model
-from parallax.server.speculation import StepTimings
+from parallax.server.step_timings import StepTimings
 from parallax.vllm.speculative import (
     accepted_token_ids,
     accepted_token_ids_of,

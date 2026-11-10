@@ -16,7 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.utils.common import SUPPORTED_LORA_TARGET_MODULES
 
 from parallax.server.executor.base_executor import BaseExecutor
-from parallax.server.speculation import StepTimings
+from parallax.server.step_timings import StepTimings
 from parallax.server.request import (
     InitialRequest,
     IntermediateRequest,
