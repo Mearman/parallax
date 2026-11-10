@@ -353,7 +353,9 @@ class VLLMExecutor(BaseExecutor):
         )
         executed = self.step_timings.clock() - started
         for req in requests:
-            self.step_timings.record(req.request_id, "execute_model", executed)
+            # A step carrying the first stage's drafts verifies them; any other step is prefill or plain decode, whose cost must not dilute the verify mean.
+            phase = "execute_verify" if getattr(req, "draft_token_ids", None) else "execute_other"
+            self.step_timings.record(req.request_id, phase, executed)
 
         # Return appropriate output based on peer position
         if return_decoded_tokens:
