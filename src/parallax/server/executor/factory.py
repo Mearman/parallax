@@ -69,6 +69,7 @@ def create_executor_config(args: argparse.Namespace, shared_state=None, conn=Non
         config.update(
             {
                 "fully_sharded_loras": getattr(args, "fully_sharded_loras", False),
+                "speculative_config": getattr(args, "speculative_config", None),
                 "enable_return_routed_experts": getattr(
                     args, "enable_return_routed_experts", False
                 ),

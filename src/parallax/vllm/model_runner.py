@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -16,6 +17,7 @@ from vllm.config import (
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
+    SpeculativeConfig,
     VllmConfig,
     set_current_vllm_config,
 )
@@ -442,6 +444,15 @@ def initialize_vllm_model_runner(
         # Workaround: save adapter_config.json locally for lora update
         download_adapter_config(lora_path)
 
+    speculative_config = None
+    speculative_json = kwargs.get("speculative_config")
+    if speculative_json:
+        speculative = json.loads(speculative_json)
+        speculative.update(
+            {"target_model_config": model_config, "target_parallel_config": parallel_config}
+        )
+        speculative_config = SpeculativeConfig(**speculative)
+
     vllm_config = VllmConfig(
         model_config=model_config,
         cache_config=cache_config,
@@ -450,7 +461,7 @@ def initialize_vllm_model_runner(
         device_config=device_config,
         load_config=load_config_for_config,
         lora_config=lora_config,
-        speculative_config=None,
+        speculative_config=speculative_config,
         quant_config=None,
         kv_transfer_config=None,
         kv_events_config=None,

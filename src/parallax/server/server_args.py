@@ -269,6 +269,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--speculative-config",
+        type=str,
+        default=None,
+        help="vLLM speculative decoding configuration as a JSON object, for example '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}' (vLLM only, single peer).",
+    )
+
+    parser.add_argument(
         "--enable-return-routed-experts",
         action="store_true",
         help="Enable returning MoE routed experts for rollout replay (vLLM only, single peer).",

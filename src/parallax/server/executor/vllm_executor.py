@@ -74,6 +74,7 @@ class VLLMExecutor(BaseExecutor):
         max_loras_per_batch: Optional[int] = None,
         max_loaded_loras: Optional[int] = None,
         fully_sharded_loras: bool = False,
+        speculative_config: Optional[str] = None,
         # Tensor Parallel Configs
         tp_rank: Optional[int] = 0,
         tp_size: Optional[int] = 1,
@@ -137,6 +138,7 @@ class VLLMExecutor(BaseExecutor):
             "max_loras_per_batch": self.max_loras_per_batch,
             "max_loaded_loras": self.max_loaded_loras,
             "fully_sharded_loras": fully_sharded_loras,
+            "speculative_config": speculative_config,
             "enable_return_routed_experts": self.enable_return_routed_experts,
             "instance_id": self.routed_experts_instance_id,
         }
