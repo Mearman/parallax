@@ -33,12 +33,7 @@ from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_kv_cache_configs,
 )
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-    KVCacheTensor,
-)
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.workspace import current_workspace_manager, init_workspace_manager
 
@@ -120,45 +115,6 @@ class ParallaxVLLMGroupCoordinator(VLLMGroupCoordinator):
         return self.pp_end_layer >= self.num_hidden_layers
 
 
-def _create_kv_cache_config_from_specs(
-    kv_cache_group: KVCacheGroupSpec,
-    attn_layers: List[str],
-    kv_cache_memory_fraction: float,
-    device: torch.device,
-) -> KVCacheConfig:
-    free_memory, total_memory = torch.cuda.mem_get_info(device.index)
-    available_memory = int(free_memory * kv_cache_memory_fraction)
-
-    logger.info(
-        f"Available GPU memory for KV cache: "
-        f"{available_memory / (1024**3):.2f} GB "
-        f"({kv_cache_memory_fraction:.1%} of {free_memory / (1024**3):.2f} GB)"
-    )
-
-    page_size_bytes = kv_cache_group.kv_cache_spec.page_size_bytes
-
-    max_blocks_by_memory = available_memory // page_size_bytes
-
-    num_blocks = max(100, min(1000, int(max_blocks_by_memory * 0.8)))
-
-    logger.debug(f"Calculated KV cache blocks: {num_blocks} (max possible: {max_blocks_by_memory})")
-
-    tensor_size_bytes = page_size_bytes * num_blocks
-
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=tensor_size_bytes,
-                shared_by=attn_layers,
-            )
-        ],
-        kv_cache_groups=[kv_cache_group],
-    )
-
-    return kv_cache_config
-
-
 class ParallaxVLLMModelRunner(GPUModelRunner):
 
     def __init__(
@@ -193,94 +149,11 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
             f"is_first={self.is_first_peer}, is_last={self.is_last_peer}"
         )
 
-    def _create_kv_cache_config(self, kv_cache_memory_fraction: float = None) -> KVCacheConfig:
-        logger.debug("Generating KV cache configuration from model...")
-
-        try:
-            kv_cache_specs = self.model.get_kv_cache_spec()
-        except AttributeError:
-            logger.warning(
-                "Cannot access get_kv_cache_spec due to cudagraph wrapper, using fallback method"
-            )
-            kv_cache_specs = None
-
-        free_memory, total_memory = torch.cuda.mem_get_info(self.device.index or 0)
-
-        memory_fraction = (
-            kv_cache_memory_fraction
-            if kv_cache_memory_fraction is not None
-            else self.cache_config.gpu_memory_utilization
-        )
-        available_memory = int(free_memory * memory_fraction)
-
-        logger.debug(
-            f"Available GPU memory for KV cache: "
-            f"{available_memory / (1024**3):.2f} GB "
-            f"({memory_fraction:.1%} of {free_memory / (1024**3):.2f} GB)"
-        )
-
-        if kv_cache_specs is not None:
-            resolve_cache_layout(self.vllm_config, kv_cache_specs)
-            kv_cache_configs = get_kv_cache_configs(
-                vllm_config=self.vllm_config,
-                kv_cache_specs=[kv_cache_specs],
-                available_memory=[available_memory],
-            )
-            kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
-            adopt_kv_cache_config(self.vllm_config, kv_cache_config)
-        else:
-            logger.debug("Using fallback KV cache configuration")
-
-            model = self.model
-            hf_config = model.model.config
-            num_attention_heads = getattr(hf_config, "num_attention_heads", 8)
-            hidden_size = getattr(hf_config, "hidden_size", 1024)
-            head_size = hidden_size // num_attention_heads
-
-            model_dtype = self.vllm_config.model_config.dtype
-            if isinstance(model_dtype, str):
-                try:
-                    from vllm.utils.torch_utils import (
-                        STR_DTYPE_TO_TORCH_DTYPE,  # type: ignore
-                    )
-                except Exception:
-                    # Older/newer vLLM versions may not expose torch_utils.
-                    # Fall back silently and default to float16.
-                    STR_DTYPE_TO_TORCH_DTYPE = {}
-                model_dtype = STR_DTYPE_TO_TORCH_DTYPE.get(model_dtype, torch.float16)
-
-            kv_cache_group = KVCacheGroupSpec(
-                layer_names=[f"model.layers.{i}" for i in range(self.start_layer, self.end_layer)],
-                kv_cache_spec=FullAttentionSpec(
-                    block_size=self.cache_config.block_size,
-                    num_kv_heads=num_attention_heads,
-                    head_size=head_size,
-                    dtype=model_dtype,
-                ),
-            )
-
-            layer_names = [f"model.layers.{i}" for i in range(self.start_layer, self.end_layer)]
-
-            kv_cache_config = _create_kv_cache_config_from_specs(
-                kv_cache_group=kv_cache_group,
-                attn_layers=layer_names,
-                kv_cache_memory_fraction=memory_fraction,
-                device=self.device,
-            )
-
-        logger.debug(
-            f"KV cache config generated: "
-            f"num_blocks={kv_cache_config.num_blocks}, "
-            f"num_groups={len(kv_cache_config.kv_cache_groups)}"
-        )
-
-        return kv_cache_config
-
     def initialize_kv_cache_manager(self, max_model_len: int) -> KVCacheManager:
         logger.debug("Initializing vLLM KVCacheManager...")
 
         if self.kv_cache_config is None:
-            self.kv_cache_config = self._create_kv_cache_config()
+            raise RuntimeError("the KV cache config must be generated before the KV cache manager is built")
 
         # vLLM's scheduler falls back to the block size when the cache config carries no hash block size.
         hash_block_size = self.kv_cache_config.hash_block_size
