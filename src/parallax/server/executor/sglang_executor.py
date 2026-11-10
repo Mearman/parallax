@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache as PageRadixCache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import SUPPORTED_LORA_TARGET_MODULES
 
 from parallax.server.executor.base_executor import BaseExecutor
@@ -194,7 +195,7 @@ class SGLExecutor(BaseExecutor):
         self.sgl_req_by_rid = {}
         self.sgl_chunked_req = None
         self.chunked_req = None
-        self.tp_group = self.model_runner.tp_group
+        self.tp_group = get_parallel().tp_group
         self.tp_cpu_group = self.tp_group.cpu_group
 
         # Create a persistent SGLang tree cache for prefill. When prefix

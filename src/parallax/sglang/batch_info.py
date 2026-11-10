@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache as PageRadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import (
     SamplingBatchInfo as SGLSamplingBatchInfo,
 )
@@ -126,7 +127,7 @@ def _get_or_create_sgl_req(
 
 def _set_dp_token_counts(schedule_batch: ScheduleBatch, model_runner: ModelRunner) -> None:
     num_tokens = schedule_batch.extend_num_tokens
-    dp_size = model_runner.dp_size
+    dp_size = get_parallel().attn_dp_size
     if dp_size > 1:
         schedule_batch.global_num_tokens = [num_tokens] * dp_size
         schedule_batch.global_num_tokens_for_logprob = [num_tokens] * dp_size
@@ -383,7 +384,7 @@ def form_sgl_batch_decode(
     running_batch.orig_seq_lens[ready_indices] += 1
 
     num_tokens = len(ready_indices)
-    dp_size = model_runner.dp_size
+    dp_size = get_parallel().attn_dp_size
     if dp_size > 1:
         ret.global_num_tokens = [num_tokens] * dp_size
         ret.global_num_tokens_for_logprob = [num_tokens] * dp_size
