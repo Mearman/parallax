@@ -438,7 +438,7 @@ class SGLExecutor(BaseExecutor):
                 if self.cur_batch.chunked_req is not None:
                     checkpoint_kv_cache(self.cur_batch.chunked_req, self.cur_batch.tree_cache)
                     self.sgl_chunked_req = self.cur_batch.chunked_req
-                    self.cur_batch.filter_batch(chunked_req_to_exclude=self.cur_batch.chunked_req)
+                    self.cur_batch.filter_batch(reqs_to_exclude=self.cur_batch.chunked_req)
                 else:
                     self.sgl_chunked_req = None
 
