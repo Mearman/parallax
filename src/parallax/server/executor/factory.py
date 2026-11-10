@@ -106,7 +106,9 @@ def create_from_args(
     elif device == "mlx":
         from parallax.server.executor.mlx_executor import MLXExecutor
 
-        executor = MLXExecutor(**config)
+        executor = MLXExecutor(
+            **config, inline_prefill_chunk_size=getattr(args, "inline_prefill_chunk_size", 0)
+        )
     else:
         raise ValueError(f"Unsupported device type: {device}")
     return executor

@@ -210,3 +210,26 @@ def test_every_snapshot_slot_is_returned():
     accepted, next_drafts = last.verify(hidden[:, -step.send_rows :], token, spec.drafts("r"), 1)
     spec.finish("r", accepted, next_drafts)
     assert cm.slot_allocator.get_num_free_slots() == free
+
+
+def test_prefilling_in_slices_gives_the_rows_of_prefilling_at_once():
+    from parallax.server.inline_prefill import prefill_in_slices
+
+    prompt = PROMPT + list(range(60, 90))
+    whole_model, whole_cache = _shard(0, SPLIT, 1), _cache(FIRST_TYPES)
+    assert whole_cache.allocate_request("r", len(prompt))[0]
+    whole = _run(whole_model, whole_cache, "r", _tokens(prompt), 0)
+    for slice_size in (1, 7, 16, len(prompt), len(prompt) + 5):
+        model, cm = _shard(0, SPLIT, 1), _cache(FIRST_TYPES)
+        assert cm.allocate_request("r", len(prompt))[0]
+        rows = prefill_in_slices(model, cm, "r", prompt, slice_size, mx.float32, 0)
+        assert rows.shape == whole.shape, slice_size
+        assert mx.allclose(rows, whole, atol=1e-4), slice_size
+
+
+def test_a_slice_size_that_is_not_positive_is_refused():
+    import pytest
+    from parallax.server.inline_prefill import prefill_in_slices
+
+    with pytest.raises(ValueError):
+        prefill_in_slices(_shard(0, SPLIT, 1), _cache(FIRST_TYPES), "r", PROMPT, 0, mx.float32, 0)

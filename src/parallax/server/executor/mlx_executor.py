@@ -12,6 +12,7 @@ import numpy as np
 
 from parallax.server.cache_manager import CacheManager
 from parallax.server.executor.base_executor import BaseExecutor
+from parallax.server.inline_prefill import continuation_inputs, prefill_in_slices
 from parallax.server.request import (
     InitialRequest,
     IntermediateRequest,
@@ -100,6 +101,8 @@ class MLXExecutor(BaseExecutor):
         enable_weight_refit: Optional[bool] = False,
         weight_refit_mode: Optional[str] = "disk",
         chunked_prefill_size: Optional[int] = None,
+        # First peer without a prefix cache: prefill a prompt in slices of this many tokens (0 prefills it whole)
+        inline_prefill_chunk_size: int = 0,
         # Pipe communication
         conn: Optional[List[Any]] = [],
     ):
@@ -279,6 +282,12 @@ class MLXExecutor(BaseExecutor):
         # steps. It is inert until a returned token carries drafts.
         self.speculation = FirstPeerSpeculation(self.cache_manager) if self.is_first_peer else None
         self._verify_steps: Dict[str, Step] = {}
+        if inline_prefill_chunk_size and (enable_prefix_cache or not self.is_first_peer):
+            raise ValueError(
+                "--inline-prefill-chunk-size is for a first peer without a prefix cache; "
+                "a peer with a prefix cache chunks through it (--chunked-prefill-size)"
+            )
+        self.inline_prefill_chunk_size = inline_prefill_chunk_size
         # self.prefix_cache = RadixCache(
         #     num_kv_heads=num_key_value_heads,
         #     head_dim=head_dim,
@@ -469,16 +478,19 @@ class MLXExecutor(BaseExecutor):
         is_prefill_batch = any(req.is_prefill for req in prepared_inputs["requests"])
 
         start_time = time.time()
-        hidden_states = self.model_shard(
-            h_or_tokens=prepared_inputs["h_or_tokens"],
-            cache=prepared_inputs["cache"],
-            mask=prepared_inputs.get("mask"),
-            block_tables=prepared_inputs.get("block_tables"),
-            context_lengths=prepared_inputs.get("context_lengths"),
-            slot_mapping=prepared_inputs.get("slot_mapping"),
-            state_slot_mapping=prepared_inputs.get("state_slot_mapping"),
-            prefix_lens=prepared_inputs.get("prefix_lens"),  # For RoPE offset in prefix cache
-        )
+        if "inline_prompts" in prepared_inputs:
+            hidden_states = self._prefill_inline(prepared_inputs)
+        else:
+            hidden_states = self.model_shard(
+                h_or_tokens=prepared_inputs["h_or_tokens"],
+                cache=prepared_inputs["cache"],
+                mask=prepared_inputs.get("mask"),
+                block_tables=prepared_inputs.get("block_tables"),
+                context_lengths=prepared_inputs.get("context_lengths"),
+                slot_mapping=prepared_inputs.get("slot_mapping"),
+                state_slot_mapping=prepared_inputs.get("state_slot_mapping"),
+                prefix_lens=prepared_inputs.get("prefix_lens"),  # For RoPE offset in prefix cache
+            )
         mx.eval(hidden_states)
 
         if self.cache_manager.needs_slots:
@@ -615,6 +627,8 @@ class MLXExecutor(BaseExecutor):
 
     def _prepare_prefill_batch(self, batched_requests: List[Request]) -> Dict[str, Any]:
         """Prepares inputs for ShardedModel from a batch of prefill requests."""
+        if self.inline_prefill_chunk_size:
+            return self._prepare_inline_prefill_batch(batched_requests)
         batch_size = len(batched_requests)
         if batch_size == 0:
             return None
@@ -802,6 +816,43 @@ class MLXExecutor(BaseExecutor):
         logger.debug(f"Prepared MLX prefill batch (size={batch_size})")
         return ret
 
+    def _prepare_inline_prefill_batch(self, batched_requests: List[Request]) -> Optional[Dict[str, Any]]:
+        """A prefill batch whose prompts are run through the shard in slices; see parallax.server.inline_prefill."""
+        if not batched_requests:
+            return None
+        for req in batched_requests:
+            assert req.is_prefill, f"Request {req.request_id} is not a prefill request."
+            success, _ = self.cache_manager.allocate_request(req.request_id, req.total_length)
+            if not success:
+                raise RuntimeError(f"OOM during prefill allocation for {req.request_id}")
+        lengths = [req.total_length for req in batched_requests]
+        return {
+            "requests": batched_requests,
+            "inline_prompts": [list(req.input_ids) for req in batched_requests],
+            "context_lengths": mx.array(lengths, dtype=mx.int32),
+            "prefix_lens": mx.zeros((len(lengths),), dtype=mx.int32),
+            "actual_processed_lengths": mx.array(lengths, dtype=mx.int32),
+        }
+
+    def _prefill_inline(self, prepared_inputs: Dict[str, Any]) -> mx.array:
+        """The rows of every request's prompt, run in slices, padded on the right to the longest."""
+        rows = [
+            prefill_in_slices(
+                self.model_shard,
+                self.cache_manager,
+                req.request_id,
+                prompt,
+                self.inline_prefill_chunk_size,
+                self.dtype,
+                self.pad_token_id,
+            )
+            for req, prompt in zip(prepared_inputs["requests"], prepared_inputs["inline_prompts"], strict=True)
+        ]
+        width = max(row.shape[1] for row in rows)
+        return mx.concatenate(
+            [mx.pad(row, [(0, 0), (0, width - row.shape[1]), (0, 0)]) for row in rows], axis=0
+        )
+
     def _is_verify_request(self, request: Request) -> bool:
         return self.speculation is not None and self.speculation.is_speculating(request.request_id)
 
@@ -817,48 +868,15 @@ class MLXExecutor(BaseExecutor):
         for req in batched_requests:
             steps.append(self.speculation.begin(req.request_id, req.output_ids[-1]))
             self._verify_steps[req.request_id] = steps[-1]
-
-        padded_inputs, padding_mask = pad_inputs(self.pad_token_id, [step.tokens for step in steps], self.dtype)
-        block_tables_list = [self.cache_manager.get_block_table(req.request_id) for req in batched_requests]
-        context_lengths = [step.prefix_len + len(step.tokens) for step in steps]
-
-        slot_mapping_tensor = None
-        if self.cache_manager.needs_blocks:
-            block_size = self.cache_manager.block_size
-            slot_mapping = []
-            for step, table in zip(steps, block_tables_list):
-                for index in range(padded_inputs.shape[1]):
-                    if index < len(step.tokens):
-                        position = step.prefix_len + index
-                        slot_mapping.append(table[position // block_size] * block_size + position % block_size)
-                    else:
-                        slot_mapping.append(-1)
-            slot_mapping_tensor = mx.array(slot_mapping, dtype=mx.int64)
-
-        max_blocks = max(len(table) for table in block_tables_list)
-        block_tables_tensor = mx.array(
-            [table + [0] * (max_blocks - len(table)) for table in block_tables_list], dtype=mx.int32
+        inputs = continuation_inputs(
+            self.cache_manager,
+            [req.request_id for req in batched_requests],
+            [step.tokens for step in steps],
+            [step.prefix_len for step in steps],
+            self.dtype,
+            self.pad_token_id,
         )
-        causal_mask = create_causal_mask(padded_inputs.shape[1], padded_inputs.shape[1], self.dtype)
-        mask = combine_padding_and_causal_masks(padding_mask, causal_mask, self.dtype)
-
-        state_slot_mapping = None
-        if self.cache_manager.needs_slots:
-            state_slot_mapping = mx.array(
-                [self.cache_manager.get_slot(req.request_id) for req in batched_requests], dtype=mx.int32
-            )
-        return {
-            "h_or_tokens": padded_inputs,
-            "cache": self.cache_manager.get_caches(),
-            "mask": mask,
-            "requests": batched_requests,
-            "block_tables": block_tables_tensor,
-            "context_lengths": mx.array(context_lengths, dtype=mx.int32),
-            "slot_mapping": slot_mapping_tensor,
-            "state_slot_mapping": state_slot_mapping,
-            "prefix_lens": mx.array([step.prefix_len for step in steps], dtype=mx.int32),
-            "verify_steps": steps,
-        }
+        return {**inputs, "requests": batched_requests, "verify_steps": steps}
 
     def _prepare_decode_batch(self, batched_requests: List[Request]) -> Optional[Dict[str, Any]]:
         """Prepares inputs for ShardedModel from a batch of decode requests."""

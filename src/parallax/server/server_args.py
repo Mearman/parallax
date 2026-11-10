@@ -269,6 +269,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--inline-prefill-chunk-size",
+        type=int,
+        default=0,
+        help="MLX first peer without a prefix cache: prefill a prompt in slices of this many tokens and send the next peer the rows of the whole prompt at once (0 prefills it whole).",
+    )
+    parser.add_argument(
         "--speculative-config",
         type=str,
         default=None,
