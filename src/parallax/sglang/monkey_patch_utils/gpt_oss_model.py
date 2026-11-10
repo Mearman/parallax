@@ -3,7 +3,7 @@
 import math
 
 import torch
-from sglang.srt.distributed import (
+from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_rank,

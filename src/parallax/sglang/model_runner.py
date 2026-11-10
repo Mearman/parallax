@@ -17,7 +17,10 @@ from sglang.srt.runtime_context import SpawnRanks, get_device, get_parallel, pub
 from sglang.srt.server_args import ServerArgs
 
 from parallax.sglang.monkey_patch import apply_parallax_sglang_monkey_patch
-from parallax.sglang.monkey_patch_utils.model_parallel import install_layer_range
+from parallax.sglang.monkey_patch_utils.model_parallel import (
+    VIRTUAL_PIPELINE_WIDTH,
+    install_layer_range,
+)
 from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
     set_layer_range_for_filtering,
 )
@@ -26,8 +29,6 @@ from parallax.utils.utils import normalize_model_config
 
 logger = logging.getLogger(__name__)
 
-# Any width above one makes SGLang treat the runner as a pipeline stage.
-PIPELINE_WIDTH_SEEN_BY_MODEL = 2
 
 
 class ParallaxModelRunner(SGLModelRunner):
@@ -70,9 +71,7 @@ class ParallaxModelRunner(SGLModelRunner):
         install_layer_range(
             get_parallel().pp_group, pp_start_layer, pp_end_layer, num_hidden_layers
         )
-        # The model code and the graph runner take the pipeline path only when the published
-        # pipeline width exceeds one; every Parallax node is one stage of a larger pipeline.
-        get_parallel().override_permanently(pp_size=PIPELINE_WIDTH_SEEN_BY_MODEL)
+        get_parallel().override_permanently(pp_size=VIRTUAL_PIPELINE_WIDTH)
 
         super().__init__(
             model_config=model_config,
@@ -126,6 +125,8 @@ def form_sgl_server_args(
         max_lora_chunk_size=max_lora_chunk_size,
         dp_size=dp_size,
         max_total_tokens=max_num_tokens_per_batch,
+        # Parallax schedules batches itself; SGLang's overlap scheduler is never used.
+        disable_overlap_schedule=True,
     )
     return sgl_server_args
 
@@ -164,7 +165,6 @@ def initialize_sgl_model_runner(
     tp_rank = kwargs.get("tp_rank", 0)
     tp_size = kwargs.get("tp_size", 1)
     dp_size = kwargs.get("dp_size", 1)
-    dp_rank = kwargs.get("dp_rank", 0)
     use_hfcache = kwargs.get("use_hfcache", False)
     nccl_port = kwargs.get("nccl_port", None)
     # Use selective download for GPU models to save bandwidth and disk space

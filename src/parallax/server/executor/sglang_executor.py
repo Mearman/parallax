@@ -9,8 +9,7 @@ import torch
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache as PageRadixCache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.utils.common import SUPPORTED_LORA_TARGET_MODULES
@@ -199,21 +198,20 @@ class SGLExecutor(BaseExecutor):
         self.tp_cpu_group = self.tp_group.cpu_group
 
         # Create a persistent SGLang tree cache for prefill. When prefix
-        # caching is disabled, ChunkCache still owns unfinished chunk state.
+        # caching is disabled, a disabled radix cache still owns unfinished chunk state.
         cache_params = CacheInitParams(
             disable=not enable_prefix_cache,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
             page_size=self.model_runner.page_size,
         )
+        self.sgl_tree_cache = PageRadixCache(cache_params)
         if enable_prefix_cache:
-            self.sgl_tree_cache = PageRadixCache(cache_params)
             self.page_tree_cache = self.sgl_tree_cache
             logger.info(
                 f"Sglang Page tree cache created with page size {self.model_runner.page_size}"
             )
         else:
-            self.sgl_tree_cache = ChunkCache(cache_params)
             self.page_tree_cache = None
 
     @staticmethod
@@ -428,11 +426,7 @@ class SGLExecutor(BaseExecutor):
         if self.cur_batch:
             if self.cur_batch.forward_mode.is_extend():
                 if self.cur_batch.chunked_req is not None:
-                    maybe_cache_unfinished_req(
-                        self.cur_batch.chunked_req,
-                        self.cur_batch.tree_cache,
-                        chunked=True,
-                    )
+                    checkpoint_kv_cache(self.cur_batch.chunked_req, self.cur_batch.tree_cache)
                     self.sgl_chunked_req = self.cur_batch.chunked_req
                     self.cur_batch.filter_batch(chunked_req_to_exclude=self.cur_batch.chunked_req)
                 else:
@@ -491,7 +485,7 @@ class SGLExecutor(BaseExecutor):
                 logger.debug("Failed to release running SGLang request %s", rid, exc_info=True)
         elif sgl_req is not None and getattr(sgl_req, "req_pool_idx", None) is not None:
             try:
-                release_kv_cache(sgl_req, self.sgl_tree_cache, is_insert=False)
+                release_kv_cache(sgl_req, self.sgl_tree_cache, checkpoint=False)
             except Exception:
                 try:
                     self.sgl_tree_cache.req_to_token_pool.free(sgl_req)

@@ -26,16 +26,34 @@ logger = logging.getLogger(__name__)
 
 
 
+# Every Parallax process is one stage of a pipeline whose other stages live in other processes
+# (and other engines), so SGLang sees a pipeline wider than the one process group it builds. Any
+# width above one makes the model code and the graph runners take their pipeline path, which is
+# the path that receives the previous stage's hidden states. The group is never used for
+# collectives: Parallax moves activations between stages itself.
+VIRTUAL_PIPELINE_WIDTH = 2
+
+
 class ParallaxGroupCoordinator(SGLGroupCoordinator):
     """A pipeline group that knows which layers its process owns.
 
-    Only the two rank predicates differ from SGLang's: a Parallax stage is first when it owns
-    layer zero and last when it owns the final layer, whatever its rank in the process group.
+    A Parallax stage is first when it owns layer zero and last when it owns the final layer,
+    whatever its rank in the process group, and the group reports the virtual pipeline width
+    so that it agrees with the width published to SGLang's runtime context.
     """
 
     pp_start_layer: int
     pp_end_layer: int
     hidden_layers: int
+
+    @property
+    def world_size(self):
+        """Return the virtual pipeline width, not the size of the one-process group."""
+        return VIRTUAL_PIPELINE_WIDTH
+
+    @world_size.setter
+    def world_size(self, value):
+        """Ignore the assignment made while SGLang builds the group."""
 
     @property
     def is_first_rank(self):

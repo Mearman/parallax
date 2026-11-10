@@ -12,7 +12,6 @@ import torch
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache as PageRadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -251,7 +250,7 @@ def form_sgl_batch_prefill(
             token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
             page_size=model_runner.server_args.page_size,
         )
-        tree_cache = ChunkCache(cache_params)
+        tree_cache = PageRadixCache(cache_params)
 
     sgl_reqs = transform_requests_to_sglang(requests, tree_cache)
 
