@@ -30,6 +30,7 @@ from parallax.vllm.model_runner import initialize_vllm_model_runner, refit_vllm_
 from parallax.vllm.speculative import (
     accepted_token_ids,
     accepted_token_ids_of,
+    SpeculationStats,
     commit_accepted,
 )
 from parallax_utils.logging_config import get_logger
@@ -100,6 +101,7 @@ class VLLMExecutor(BaseExecutor):
         conn: Optional[List[Any]] = [],
     ):
         self.enable_return_routed_experts = enable_return_routed_experts
+        self.speculation = SpeculationStats()
         self.routed_experts_reader = None
         self.routed_experts_instance_id = None
 
@@ -244,9 +246,14 @@ class VLLMExecutor(BaseExecutor):
                     # the first one that finishes the request ends the step.
                     committed: List[int] = []
                     if not req.abort and req.next_token_id is not None:
+                        accepted = accepted_token_ids(req)
+                        if req.hidden_states is not None:
+                            self.speculation.record(
+                                original_req.request_id, req.hidden_states.shape[-1], len(accepted)
+                            )
                         committed = commit_accepted(
                             original_req,
-                            accepted_token_ids(req),
+                            accepted,
                             self.scheduler.check_and_update_request_status,
                         )
                         logger.debug(
@@ -262,6 +269,9 @@ class VLLMExecutor(BaseExecutor):
                         original_req.abort = True
 
                     if self.scheduler.check_and_update_request_status(original_req):
+                        summary = self.speculation.summary(original_req.request_id)
+                        if summary:
+                            logger.info(summary)
                         logger.debug(f"Releasing resources for finished request {req.request_id}")
                         self.release_and_evict_request(req.request_id)
                         if not self.is_last_peer:
