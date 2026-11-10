@@ -585,6 +585,10 @@ def initialize_vllm_model_runner(
 
         kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         adopt_kv_cache_config(model_runner.vllm_config, kv_cache_config)
+        logger.info(
+            f"KV cache allocated: {kv_cache_config.num_blocks} blocks of "
+            f"{model_runner.vllm_config.cache_config.block_size} tokens"
+        )
 
         model_runner.kv_cache_config = kv_cache_config
 
