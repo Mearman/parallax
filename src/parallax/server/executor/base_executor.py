@@ -544,24 +544,38 @@ class BaseExecutor:
             return None
 
         prefill_reqs: List[Request] = []
+        verify_reqs: List[Request] = []
         decode_reqs: List[Request] = []
         for req in batched_requests:
             if req.is_prefill:
                 prefill_reqs.append(req)
             elif req.is_decoding:
-                decode_reqs.append(req)
+                (verify_reqs if self._is_verify_request(req) else decode_reqs).append(req)
         prefill_batch = self._prepare_prefill_batch(prefill_reqs)
+        verify_batch = self._prepare_verify_batch(verify_reqs)
         decode_batch = self._prepare_decode_batch(decode_reqs)
-        if prefill_batch is None and decode_batch is None:
+        if prefill_batch is None and verify_batch is None and decode_batch is None:
             return None
         if prefill_batch is not None:
             logger.debug(f"Prepared prefill batch with {len(prefill_batch['requests'])} requests.")
+        if verify_batch is not None:
+            logger.debug(f"Prepared verify batch with {len(verify_batch['requests'])} requests.")
         if decode_batch is not None:
             logger.debug(f"Prepared decode batch with {len(decode_batch['requests'])} requests.")
         return {
             "prefill_batch": prefill_batch,
+            "verify_batch": verify_batch,
             "decode_batch": decode_batch,
         }
+
+    def _is_verify_request(self, request: Request) -> bool:
+        """Whether a decoding request runs as a speculative verify step: its input token together with drafts."""
+        return False
+
+    def _prepare_verify_batch(self, batched_requests: List[Request]) -> Optional[Dict[str, Any]]:
+        """Prepare the speculative verify steps of the requests `_is_verify_request` selected; none by default."""
+        assert not batched_requests, "this executor does not run verify steps"
+        return None
 
     def prepare_next_batch_requests(
         self, requests: List[Request], batch_output: Any, context_lengths: Any
@@ -704,7 +718,7 @@ class BaseExecutor:
                 prepared_inputs_dict = self.prepare_batch_inputs(batch_to_process)
 
                 # We will process prefill and decode batches separately for now
-                for batch_type in ["prefill_batch", "decode_batch"]:
+                for batch_type in ["prefill_batch", "verify_batch", "decode_batch"]:
                     if prepared_inputs_dict and prepared_inputs_dict.get(batch_type):
                         prepared_inputs = prepared_inputs_dict[batch_type]
 
@@ -713,7 +727,7 @@ class BaseExecutor:
                             prepared_inputs, return_decoded_tokens=self.is_last_peer
                         )
                         # Update metrics with per-layer latency sample (throttled by decode steps)
-                        if batch_type == "decode_batch":
+                        if batch_type in ("decode_batch", "verify_batch"):
                             try:
                                 self._decode_steps_since_metric += len(prepared_inputs["requests"])
                                 if (

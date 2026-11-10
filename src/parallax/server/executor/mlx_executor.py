@@ -19,6 +19,8 @@ from parallax.server.request import (
     RequestStatus,
 )
 from parallax.server.sampling.sampler import SamplingBatchInfo
+from parallax.server.speculation import accepted_token_ids, commit_accepted
+from parallax.server.split_speculation import FirstPeerSpeculation, Step
 from parallax.server.shard_loader import MLXModelLoader
 from parallax.utils.chunked_prefill import (
     complete_local_middle_chunk,
@@ -273,6 +275,10 @@ class MLXExecutor(BaseExecutor):
         # Prefix Cache Manager
         self.enable_prefix_cache = enable_prefix_cache
         self.chunked_req = None
+        # Speculation across a split: the first peer folds the drafts the last peer proposes into its decode
+        # steps. It is inert until a returned token carries drafts.
+        self.speculation = FirstPeerSpeculation(self.cache_manager) if self.is_first_peer else None
+        self._verify_steps: Dict[str, Step] = {}
         # self.prefix_cache = RadixCache(
         #     num_kv_heads=num_key_value_heads,
         #     head_dim=head_dim,
@@ -351,8 +357,9 @@ class MLXExecutor(BaseExecutor):
                         )
                         continue
 
+                    committed: List[int] = []
                     if not req.abort and req.next_token_id is not None:
-                        original_req.commit_new_token(req.next_token_id)
+                        committed = self._commit_returned_tokens(original_req, req)
 
                     if len(req.routing_table) > 0:
                         original_req.routing_table = req.routing_table
@@ -372,11 +379,19 @@ class MLXExecutor(BaseExecutor):
                     else:
                         self.scheduler.enque_request(original_req)
 
-                    # Send token/terminal update to the Rust frontend.
+                    # Send token/terminal update to the Rust frontend: every committed token, the last one
+                    # carrying the request's finish state.
                     if self.tp_rank == 0:
+                        for token_id in committed[:-1]:
+                            self._send_engine_core_token_output(
+                                request_id=original_req.request_id,
+                                token_id=token_id,
+                                finish_reason=None,
+                                stop_reason=None,
+                            )
                         self.send_engine_core_request_output(
                             request=original_req,
-                            token_id=req.next_token_id,
+                            token_id=committed[-1] if committed else req.next_token_id,
                         )
                 else:
                     raise TypeError(f"First peer received unexpected request type: {type(req)}")
@@ -400,9 +415,28 @@ class MLXExecutor(BaseExecutor):
                     # This is an active request, add it to the scheduler queue to be processed.
                     self.scheduler.enque_request(req)
 
+    def _commit_returned_tokens(self, original_req: InitialRequest, returned: IntermediateRequest) -> List[int]:
+        """Commit the tokens the last peer returned for a request and tell the speculation what it accepted.
+
+        A step returns the drafts it accepted followed by the token it sampled, and the next step's drafts. The first
+        return after the prompt starts speculation if it carries drafts. A request that finishes inside the accepted
+        tokens ends the step there, so tokens beyond it are never committed.
+        """
+        accepted = accepted_token_ids(returned)
+        drafts = returned.draft_token_ids or []
+        rid = original_req.request_id
+        if self.speculation.in_flight(rid):
+            self.speculation.finish(rid, accepted, drafts)
+        elif drafts:
+            self.speculation.start(rid, drafts)
+        return commit_accepted(original_req, accepted, self.scheduler.check_and_update_request_status)
+
     def prepare_next_batch_requests(
         self, requests: List[Request], batch_output: Any, context_lengths: Any
     ) -> List[Request]:
+        steps = batch_output.get("verify_steps") if isinstance(batch_output, dict) else None
+        if steps is not None:
+            return self._prepare_next_verify_requests(requests, batch_output["hidden_states"], steps)
         next_batch = super().prepare_next_batch_requests(requests, batch_output, context_lengths)
         return filter_middle_chunk_next_batch(
             self,
@@ -410,6 +444,18 @@ class MLXExecutor(BaseExecutor):
             next_batch,
             release_callback=self.cache_manager.release_request,
         )
+
+    def _prepare_next_verify_requests(
+        self, requests: List[Request], hidden_states: mx.array, steps: List[Step]
+    ) -> List[Request]:
+        """The requests for the next peer after verify steps: the rows of the input token and its drafts, with the drafts."""
+        next_batch = []
+        for index, (request, step) in enumerate(zip(requests, steps, strict=True)):
+            rows = hidden_states[index, len(step.tokens) - step.send_rows : len(step.tokens), :]
+            next_request = self._prepare_next_single_request(request, rows, None)
+            next_request.draft_token_ids = list(self.speculation.drafts(request.request_id))
+            next_batch.append(next_request)
+        return next_batch
 
     def process_batch(self, prepared_inputs: Dict[str, Any], return_decoded_tokens: bool = True):
         """Process a batch of requests in MLX."""
@@ -539,11 +585,18 @@ class MLXExecutor(BaseExecutor):
             # Return dict with token_ids and optional probs
             return {"hidden_states": token_ids, "probs": token_probs}
         # Intermediate peer: return hidden states without probs
-        return {"hidden_states": hidden_states, "probs": None}
+        return {
+            "hidden_states": hidden_states,
+            "probs": None,
+            "verify_steps": prepared_inputs.get("verify_steps"),
+        }
 
     def _release_request(self, rid: str):
         """Release per-request resources in MLX."""
         try:
+            if getattr(self, "speculation", None) is not None:
+                self.speculation.release(rid)
+                self._verify_steps.pop(rid, None)
             if hasattr(self, "cache_manager") and self.cache_manager is not None:
                 self.cache_manager.release_request(rid)
         except Exception:
@@ -747,6 +800,64 @@ class MLXExecutor(BaseExecutor):
         }
         logger.debug(f"Prepared MLX prefill batch (size={batch_size})")
         return ret
+
+    def _is_verify_request(self, request: Request) -> bool:
+        return self.speculation is not None and self.speculation.is_speculating(request.request_id)
+
+    def _prepare_verify_batch(self, batched_requests: List[Request]) -> Optional[Dict[str, Any]]:
+        """Inputs for the speculative steps of requests whose last peer proposed drafts.
+
+        Each request runs its pending tokens, its input token and its drafts as one chunk that continues from the tokens
+        this peer has absorbed, the way a later chunk of a chunked prefill does.
+        """
+        if not batched_requests:
+            return None
+        steps: List[Step] = []
+        for req in batched_requests:
+            steps.append(self.speculation.begin(req.request_id, req.output_ids[-1]))
+            self._verify_steps[req.request_id] = steps[-1]
+
+        padded_inputs, padding_mask = pad_inputs(self.pad_token_id, [step.tokens for step in steps], self.dtype)
+        block_tables_list = [self.cache_manager.get_block_table(req.request_id) for req in batched_requests]
+        context_lengths = [step.prefix_len + len(step.tokens) for step in steps]
+
+        slot_mapping_tensor = None
+        if self.cache_manager.needs_blocks:
+            block_size = self.cache_manager.block_size
+            slot_mapping = []
+            for step, table in zip(steps, block_tables_list):
+                for index in range(padded_inputs.shape[1]):
+                    if index < len(step.tokens):
+                        position = step.prefix_len + index
+                        slot_mapping.append(table[position // block_size] * block_size + position % block_size)
+                    else:
+                        slot_mapping.append(-1)
+            slot_mapping_tensor = mx.array(slot_mapping, dtype=mx.int64)
+
+        max_blocks = max(len(table) for table in block_tables_list)
+        block_tables_tensor = mx.array(
+            [table + [0] * (max_blocks - len(table)) for table in block_tables_list], dtype=mx.int32
+        )
+        causal_mask = create_causal_mask(padded_inputs.shape[1], padded_inputs.shape[1], self.dtype)
+        mask = combine_padding_and_causal_masks(padding_mask, causal_mask, self.dtype)
+
+        state_slot_mapping = None
+        if self.cache_manager.needs_slots:
+            state_slot_mapping = mx.array(
+                [self.cache_manager.get_slot(req.request_id) for req in batched_requests], dtype=mx.int32
+            )
+        return {
+            "h_or_tokens": padded_inputs,
+            "cache": self.cache_manager.get_caches(),
+            "mask": mask,
+            "requests": batched_requests,
+            "block_tables": block_tables_tensor,
+            "context_lengths": mx.array(context_lengths, dtype=mx.int32),
+            "slot_mapping": slot_mapping_tensor,
+            "state_slot_mapping": state_slot_mapping,
+            "prefix_lens": mx.array([step.prefix_len for step in steps], dtype=mx.int32),
+            "verify_steps": steps,
+        }
 
     def _prepare_decode_batch(self, batched_requests: List[Request]) -> Optional[Dict[str, Any]]:
         """Prepares inputs for ShardedModel from a batch of decode requests."""

@@ -52,6 +52,19 @@ class FirstPeerSpeculation:
     def drafts(self, request_id: str) -> List[int]:
         return self._requests[request_id].drafts
 
+    def has(self, request_id: str) -> bool:
+        return request_id in self._requests
+
+    def in_flight(self, request_id: str) -> bool:
+        """Whether a step of this request has been sent and its verdict has not come back."""
+        request = self._requests.get(request_id)
+        return request is not None and bool(request.chunk)
+
+    def is_speculating(self, request_id: str) -> bool:
+        """Whether this request's next step is a verify step: it has drafts to verify or accepted tokens to absorb."""
+        request = self._requests.get(request_id)
+        return request is not None and bool(request.drafts or request.pending)
+
     def begin(self, request_id: str, input_token: int) -> Step:
         """Reserve the cache for this step's chunk and snapshot the state it will change."""
         request = self._requests[request_id]
