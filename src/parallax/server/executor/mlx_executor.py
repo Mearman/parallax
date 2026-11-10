@@ -369,6 +369,7 @@ class MLXExecutor(BaseExecutor):
                         original_req.abort = True
 
                     if self.scheduler.check_and_update_request_status(original_req):
+                        self.speculation.release(original_req.request_id)
                         self.cache_manager.release_request(original_req.request_id)
                         logger.debug(
                             f"Released resources for finished request {req.request_id}, "
