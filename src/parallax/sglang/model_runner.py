@@ -8,11 +8,13 @@ import logging
 import random
 from typing import List, Optional
 
+import torch
 from mlx_lm.utils import load_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.bootstrap import init_layer_runtime, init_parallel_runtime
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.model_executor.model_runner import ModelRunner as SGLModelRunner
+from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.runtime_context import SpawnRanks, get_device, get_parallel, publish
 from sglang.srt.server_args import ServerArgs
 
@@ -81,6 +83,24 @@ class ParallaxModelRunner(SGLModelRunner):
             nccl_port=nccl_port,
             server_args=server_args,
         )
+
+    def allocate_serving_state(self) -> None:
+        """Allocate the KV pools, attention backends and graphs a constructed runner serves with.
+
+        SGLang's runner only loads the model when it is constructed; its scheduler then allocates the
+        pools, builds the attention backends, captures the graphs and warms the sampler, in this
+        order. Parallax has no SGLang scheduler, so this performs the same steps for the one
+        target runner.
+        """
+        self.account_preloaded_weights(self.preloaded_weights_bytes)
+        self.alloc_memory_pool()
+        self.init_attention_backends()
+        self.init_cuda_graphs()
+        prewarm_graph_pool_borrow()
+        with torch.get_device_module(self.device).stream(self.forward_stream):
+            self.prewarm_sampling()
+        if self.token_to_kv_pool.post_capture_active:
+            self.post_capture_resize_kv_pool()
 
 
 def form_sgl_server_args(
@@ -202,7 +222,7 @@ def initialize_sgl_model_runner(
 
     architectures = config.get("architectures", [])
     if architectures and any("Qwen3Next" in arch for arch in architectures):
-        logger.debug(f"Qwen3-Next model detected, setting kv_block_size to 1")
+        logger.debug("Qwen3-Next model detected, setting kv_block_size to 1")
         kv_block_size = 1
 
     server_args = form_sgl_server_args(
@@ -265,6 +285,7 @@ def initialize_sgl_model_runner(
         pp_end_layer=end_layer,
         tp_rank=tp_rank,
     )
+    model_runner.allocate_serving_state()
     return model_runner, config, tokenizer
 
 
@@ -275,13 +296,13 @@ def refit_sgl_model(
 ):
     """Runtime weight refit from disk"""
     if tensors is not None:
-        logger.info(f"Executor begins weight refit from host memory")
+        logger.info("Executor begins weight refit from host memory")
         for x in tensors.keys():
             refit_tensors = [(x, tensors.get(x))]
             model_runner.update_weights_from_tensor(named_tensors=refit_tensors, load_format=None)
     elif refit_weight_path is not None:
-        logger.info(f"Executor begins weight refit from disk files")
+        logger.info("Executor begins weight refit from disk files")
         model_runner.update_weights_from_disk(model_path=refit_weight_path, load_format="auto")
     else:
         assert False, "Weight refit needs host tensors or weight path"
-    logger.info(f"Finish weight refit")
+    logger.info("Finish weight refit")
