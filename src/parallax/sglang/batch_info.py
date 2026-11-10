@@ -329,8 +329,8 @@ def select_batch(
         ret.out_cache_loc = origin_batch.out_cache_loc[keep_indices_device]
     ret.seq_lens_sum = ret.seq_lens.sum().item()
 
-    if origin_batch.output_ids is not None:
-        ret.output_ids = origin_batch.output_ids[keep_indices_device]
+    # input_ids is not carried over: a running batch holds its last prefill's tokens, not one per
+    # request, and the decode builder sets the step's tokens.
 
     ret.return_logprob = any(req.return_logprob for req in origin_batch.reqs)
     if ret.return_logprob:
@@ -381,18 +381,16 @@ def form_sgl_batch_decode(
         output_ids = []
         for request in requests:
             output_ids.append(request.output_ids[-1])
-        ret.output_ids = torch.tensor(output_ids, dtype=torch.int64).to(
+        ret.input_ids = torch.tensor(output_ids, dtype=torch.int64).to(
             ret.device, non_blocking=True
         )
     else:
-        # Set an empty output_ids tensor
+        # Set an empty input_ids tensor
         batch_size = len(ready_indices)
-        ret.output_ids = torch.empty(batch_size, dtype=torch.int64).to(
+        ret.input_ids = torch.empty(batch_size, dtype=torch.int64).to(
             ret.device, non_blocking=True
         )
     ret.prepare_for_decode()
-    # SGLang feeds a decode step from input_ids, which its scheduler sets to the previous step's token.
-    ret.input_ids = ret.output_ids
     # TODO: this is a hack to make the seq_lens correct due to select_batch is not refference running batch's seq_lens
     # need to fix this
     running_batch.seq_lens[ready_indices] += 1
