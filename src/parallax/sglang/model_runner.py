@@ -103,8 +103,12 @@ def form_sgl_server_args(
     lora_backend: Optional[str] = "triton",
     max_lora_chunk_size: Optional[int] = 128,
     max_num_tokens_per_batch: int = 16384,
+    chunked_prefill_size: Optional[int] = None,
 ):
-    """Creates a SGL ServerArgs object"""
+    """Creates a SGL ServerArgs object.
+
+    chunked_prefill_size is None when the caller does not chunk prefills, which SGLang spells -1.
+    """
     sgl_server_args = ServerArgs(
         model_path=model_path,
         dtype=dtype,
@@ -126,6 +130,7 @@ def form_sgl_server_args(
         max_lora_chunk_size=max_lora_chunk_size,
         dp_size=dp_size,
         max_total_tokens=max_num_tokens_per_batch,
+        chunked_prefill_size=-1 if chunked_prefill_size is None else chunked_prefill_size,
         # Parallax schedules batches itself; SGLang's overlap scheduler is never used.
         disable_overlap_schedule=True,
     )
@@ -141,6 +146,7 @@ def initialize_sgl_model_runner(
     kv_block_size: int,
     moe_runner_backend: str,
     max_num_tokens_per_batch: int = 16384,
+    chunked_prefill_size: Optional[int] = None,
     enable_lora: Optional[bool] = False,
     max_lora_rank: Optional[int] = None,
     lora_target_modules: Optional[List[str]] = None,
@@ -219,6 +225,7 @@ def initialize_sgl_model_runner(
         lora_backend,
         max_lora_chunk_size,
         max_num_tokens_per_batch=max_num_tokens_per_batch,
+        chunked_prefill_size=chunked_prefill_size,
     )
     quant_method = None
     if (quantization_config := config.get("quantization_config", None)) is not None:

@@ -115,7 +115,13 @@ class SGLExecutor(BaseExecutor):
         if self.lora_paths is not None:
             logger.info(f"LoRA paths provided: {[str(lora_path) for lora_path in self.lora_paths]}")
 
+        # SGLang reads the chunk size from its published configuration, which is fixed once the
+        # runner exists, so the size is rounded to the block size before the runner is built.
+        self.chunked_prefill_size = self._normalize_chunked_prefill_size(
+            chunked_prefill_size, kv_block_size
+        )
         model_runner_params = {
+            "chunked_prefill_size": self.chunked_prefill_size,
             "model_repo": model_repo,
             "start_layer": start_layer,
             "end_layer": end_layer,
@@ -157,10 +163,13 @@ class SGLExecutor(BaseExecutor):
         if device is None or device == "cuda":
             device = f"cuda:{tp_rank}"
 
-        self.chunked_prefill_size = self._normalize_chunked_prefill_size(
+        if self.chunked_prefill_size != self._normalize_chunked_prefill_size(
             chunked_prefill_size, self.model_runner.page_size
-        )
-        self.model_runner.server_args.chunked_prefill_size = self.chunked_prefill_size
+        ):
+            raise ValueError(
+                f"chunked prefill size {self.chunked_prefill_size} was rounded to the block size "
+                f"{kv_block_size}, but SGLang resolved the page size to {self.model_runner.page_size}"
+            )
 
         super().__init__(
             start_layer=start_layer,
