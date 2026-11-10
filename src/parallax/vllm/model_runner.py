@@ -148,6 +148,7 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
         self.pending_drafts: Dict[str, List[int]] = {}
         # How many draft slots the last step scheduled for each request.
         self.step_draft_counts: Dict[str, int] = {}
+        self._logged_draft_state = ""
 
         super().__init__(vllm_config=vllm_config, device=device)
         self.kv_cache_config = kv_cache_config
@@ -183,6 +184,19 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
         self.kv_cache_manager = kv_cache_manager
 
         return kv_cache_manager
+
+    def _log_draft_state_on_change(self) -> None:
+        """Log what the drafter and its buffers hold after a step, each time that changes, so a run that never drafts says why."""
+        draft_ids = self._draft_token_ids
+        state = (
+            f"drafter={type(getattr(self, 'drafter', None)).__name__} num_spec_tokens={self.num_spec_tokens} "
+            f"async_scheduling={self.use_async_scheduling} "
+            f"draft_token_ids={type(draft_ids).__name__}{tuple(draft_ids.shape) if hasattr(draft_ids, 'shape') else ''} "
+            f"draft_token_req_ids={'set' if self._draft_token_req_ids else self._draft_token_req_ids}"
+        )
+        if state != self._logged_draft_state:
+            self._logged_draft_state = state
+            logger.info(f"speculation state: {state}")
 
     def load_model(self, load_dummy_weights: bool = False, *, model=None) -> None:
         logger.debug(f"Loading vLLM model with layers [{self.start_layer}, {self.end_layer})...")
@@ -248,6 +262,7 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
                 sampler_output.sampled_token_ids, 1 + self.num_spec_tokens
             )
             sampled_token_ids = sampled_token_ids_cpu.to(self.device)
+            self._log_draft_state_on_change()
             drafts = self.take_draft_token_ids()
             if drafts is not None:
                 for request_id, draft_token_ids in zip(drafts.req_ids, drafts.draft_token_ids):
