@@ -56,7 +56,6 @@ class VLLMExecutor(BaseExecutor):
         # Metrics Configs
         layer_latency_update_every: int = 4096,
         # KV Cache Configs
-        kv_block_size: int = 64,
         kv_cache_memory_fraction: float = 0.8,
         enable_prefix_cache: Optional[bool] = False,
         # Communication Configs
@@ -123,7 +122,6 @@ class VLLMExecutor(BaseExecutor):
             "end_layer": end_layer,
             "kv_cache_memory_fraction": kv_cache_memory_fraction,
             "attention_backend": attention_backend,
-            "kv_block_size": kv_block_size,
             "max_batch_size": max_batch_size,
             "max_sequence_length": max_sequence_length,
             "max_num_tokens_per_batch": max_num_tokens_per_batch,
@@ -170,7 +168,7 @@ class VLLMExecutor(BaseExecutor):
             shared_state=shared_state,
             enable_weight_refit=enable_weight_refit,
             weight_refit_mode=weight_refit_mode,
-            kv_block_size=kv_block_size,
+            kv_block_size=self.model_runner.cache_config.block_size,
             conn=conn,
         )
         if self.enable_return_routed_experts:

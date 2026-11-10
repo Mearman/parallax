@@ -63,6 +63,9 @@ def create_executor_config(args: argparse.Namespace, shared_state=None, conn=Non
             }
         )
     elif args.gpu_backend == "vllm":
+        # vLLM chooses the attention block size itself (a hybrid model's depends on its recurrent state page),
+        # so the executor reads it back from the cache config instead of taking one here.
+        del config["kv_block_size"]
         config.update(
             {
                 "fully_sharded_loras": getattr(args, "fully_sharded_loras", False),

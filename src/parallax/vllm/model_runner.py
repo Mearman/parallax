@@ -22,6 +22,7 @@ from vllm.config import (
 from vllm.distributed.kv_transfer.kv_connector.utils import get_current_attn_backends
 from vllm.distributed.parallel_state import GroupCoordinator as VLLMGroupCoordinator
 from vllm.lora.request import LoRARequest
+from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import (
     get_supported_kv_cache_layouts,
     record_kv_cache_layout,
@@ -396,7 +397,6 @@ def initialize_vllm_model_runner(
     end_layer: int,
     kv_cache_memory_fraction: float,
     attention_backend: str,
-    kv_block_size: int,
     max_batch_size: int,
     max_sequence_length: int,
     max_num_tokens_per_batch: int = 16384,
@@ -484,13 +484,10 @@ def initialize_vllm_model_runner(
     )
 
     cache_config = CacheConfig(
-        block_size=kv_block_size,
+        # Left unset: in the align cache mode vLLM enlarges the attention block of a hybrid (mamba) model until its
+        # page matches the recurrent state's page. A fixed small block is padded to that page size instead.
         gpu_memory_utilization=kv_cache_memory_fraction,
         cache_dtype="auto",
-        # Parallax manages its own prefix state and never enables vLLM's. Leaving the default on puts hybrid
-        # (mamba) models in the "align" cache mode, which keeps a recurrent state per block and so needs far more
-        # memory than the one state per request that the "none" mode keeps.
-        enable_prefix_caching=False,
     )
 
     parallel_config = ParallelConfig(
@@ -512,7 +509,8 @@ def initialize_vllm_model_runner(
         max_num_seqs=max_num_seqs,
         max_model_len=model_config.max_model_len,
         is_encoder_decoder=False,
-        enable_chunked_prefill=False,
+        # The align cache mode that hybrid (mamba) models use with vLLM's default prefix caching requires it.
+        enable_chunked_prefill=True,
     )
 
     # LoRA Config construction
@@ -652,6 +650,10 @@ def initialize_vllm_model_runner(
         logger.info("Loading vLLM model (partial layers)...")
         model_runner.load_model()
         logger.info("vLLM model loaded successfully")
+
+        # vLLM's executors do this right after the model loads: it settles the attention block size, and for a
+        # hybrid (mamba) model aligns it so the attention page equals the recurrent state's page.
+        current_platform.update_block_size_for_backend(vllm_config)
 
         logger.debug("Letting vLLM automatically generate KV cache configuration...")
 
