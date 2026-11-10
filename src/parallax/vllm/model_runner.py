@@ -403,6 +403,9 @@ def initialize_vllm_model_runner(
         is_encoder_decoder=False,
         # The align cache mode that hybrid (mamba) models use with vLLM's default prefix caching requires it.
         enable_chunked_prefill=True,
+        # Parallax calls the runner step by step. Under async scheduling vLLM copies the drafted tokens to the CPU only
+        # for structured output, so this runner would never see them.
+        async_scheduling=False,
     )
 
     # LoRA Config construction
