@@ -634,8 +634,17 @@ class BaseExecutor:
 
         return batched_requests
 
+    def log_step_timing(self, rid: str) -> None:
+        """Log the per-phase step timing a finished request recorded, when this executor records any. Once only: the summary forgets the request."""
+        timings = getattr(self, "step_timings", None)
+        line = timings.summary(rid) if timings is not None else ""
+        if line:
+            logger.info(line)
+
     def release_and_evict_request(self, rid: str):
         """Release per-request resources and evict from scheduler. Best-effort, never raises."""
+        # A request that finishes on a path with no summary of its own (one peer holding every layer) still reports its timing.
+        self.log_step_timing(rid)
         # Release resources
         self._release_request(rid)
 
