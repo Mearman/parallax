@@ -434,6 +434,8 @@ class SGLExecutor(BaseExecutor):
             forward_batch=forward_batch,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        # SGLang launches the forward asynchronously: wait for the device so the recorded time is the step's compute.
+        torch.cuda.synchronize()
         forward_seconds = self.step_timings.clock() - started
         phase = "forward_extend" if forward_batch.forward_mode.is_extend() else "forward_decode"
         for req in requests:
